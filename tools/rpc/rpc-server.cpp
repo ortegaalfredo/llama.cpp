@@ -95,7 +95,7 @@ struct rpc_server_params {
     std::string              host        = "127.0.0.1";
     int                      port        = 50052;
     bool                     use_cache   = true;
-    // cache size limit in GiB, 0 = no fixed limit (10% of the disk is always kept free)
+    // cache size limit in GiB, 0 = no fixed limit (2 GiB of disk is always kept free)
     double                   cache_size  = 0;
     int                      n_threads   = std::max(1U, std::thread::hardware_concurrency()/2);
     std::vector<std::string> devices;
@@ -116,7 +116,7 @@ static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
     fprintf(stderr, "  -c, --cache                      cache weights on disk so reloads skip the network (default: on)\n");
     fprintf(stderr, "      --no-cache                   disable the weight cache\n");
     fprintf(stderr, "      --cache-size GiB             cache size limit, least recently used entries are evicted\n");
-    fprintf(stderr, "                                   (default: 0 = no fixed limit; 10%% of the disk is always kept free)\n");
+    fprintf(stderr, "                                   (default: 0 = no fixed limit; 2 GiB of disk is always kept free)\n");
     fprintf(stderr, "  -z, --compression LEVEL          most aggressive transport compression accepted from clients:\n");
     fprintf(stderr, "                                   none, zstd, q8, q6, q4 (default: q4, i.e. whatever the client asks)\n");
     fprintf(stderr, "                                   zstd is lossless; q8/q6/q4 quantize activations on the wire to\n");

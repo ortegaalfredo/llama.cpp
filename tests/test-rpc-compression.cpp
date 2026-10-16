@@ -187,6 +187,37 @@ int main(int argc, char ** argv) {
     ggml_backend_tensor_get(act2, y.data(), 0, nbytes);
     CHECK(memcmp(mask.data(), y.data(), nbytes) == 0, "mask round trip exact");
 
+    // identical weight tensors (models often repeat one, e.g. constant
+    // norms). Large enough for the server's weight cache; when the server
+    // cannot store them (full cache or disk), every copy must still arrive
+    {
+        const int64_t n = 512*1024; // 2 MiB of f32
+        ggml_init_params params = { 3*ggml_tensor_overhead(), nullptr, true };
+        ggml_context * ctx_d = ggml_init(params);
+        ggml_tensor * dup[3];
+        for (auto & t : dup) {
+            t = ggml_new_tensor_1d(ctx_d, GGML_TYPE_F32, n);
+        }
+        ggml_backend_buffer_t buf_d = ggml_backend_alloc_ctx_tensors(ctx_d, backend);
+        ggml_backend_buffer_set_usage(buf_d, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        std::vector<float> v(n), back(n);
+        for (int64_t i = 0; i < n; ++i) {
+            v[i] = std::sin(0.001f*i);
+        }
+        for (auto & t : dup) {
+            ggml_backend_tensor_set(t, v.data(), 0, n*sizeof(float));
+        }
+        bool ok = true;
+        for (auto & t : dup) {
+            std::fill(back.begin(), back.end(), 0.0f);
+            ggml_backend_tensor_get(t, back.data(), 0, n*sizeof(float));
+            ok = ok && memcmp(v.data(), back.data(), n*sizeof(float)) == 0;
+        }
+        CHECK(ok, "identical weight tensors round trip exact");
+        ggml_backend_buffer_free(buf_d);
+        ggml_free(ctx_d);
+    }
+
     ggml_backend_buffer_free(buf_w);
     ggml_backend_buffer_free(buf_a);
     ggml_backend_buffer_free(buf_kv);

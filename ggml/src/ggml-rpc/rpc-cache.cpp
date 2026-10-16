@@ -323,9 +323,9 @@ rpc_disk_cache::rpc_disk_cache(const std::string & dir, uint64_t max_bytes) : di
     }
     LOG_INFO("  cache entries  : %zu (%.2f GiB)\n", index.size(), total / 1073741824.0);
     if (max_bytes > 0) {
-        LOG_INFO("  cache limit    : %.2f GiB, keeping 10%% of the disk free\n", max_bytes / 1073741824.0);
+        LOG_INFO("  cache limit    : %.2f GiB, keeping 2 GiB of disk free\n", max_bytes / 1073741824.0);
     } else {
-        LOG_INFO("  cache limit    : none, keeping 10%% of the disk free\n");
+        LOG_INFO("  cache limit    : none, keeping 2 GiB of disk free\n");
     }
     if (n_removed > 0) {
         LOG_INFO("  cache cleanup  : removed %zu stale files\n", n_removed);
@@ -390,12 +390,15 @@ bool rpc_disk_cache::load(const rpc_digest & digest, uint64_t size, std::vector<
     return true;
 }
 
+// free disk space the cache always leaves
+static constexpr uint64_t RPC_CACHE_DISK_RESERVE = 2ull << 30;
+
 bool rpc_disk_cache::ensure_space(uint64_t need) {
     while (true) {
         std::error_code ec;
         const fs::space_info space = fs::space(dir, ec);
         const bool over_limit = max_bytes > 0 && total + need > max_bytes;
-        const bool low_disk   = !ec && space.available < need + space.capacity / 10;
+        const bool low_disk   = !ec && space.available < need + RPC_CACHE_DISK_RESERVE;
         if (!over_limit && !low_disk) {
             return true;
         }
@@ -427,7 +430,16 @@ bool rpc_disk_cache::store(const void * data, size_t size) {
     }
     if (!ensure_space(size)) {
         if (!warned_full) {
-            LOG_WARN("[%s] cache is full (%.2f GiB in use), not caching more tensors for this client\n", __func__, total / 1073741824.0);
+            std::error_code ec;
+            const fs::space_info space = fs::space(dir, ec);
+            if (max_bytes > 0 && total + size > max_bytes) {
+                LOG_WARN("[%s] cache size limit reached (%.2f of %.2f GiB in use by entries this client needs), "
+                         "not caching more tensors for this client\n", __func__, total / 1073741824.0, max_bytes / 1073741824.0);
+            } else {
+                LOG_WARN("[%s] not enough free disk space for the cache (%.2f GiB free, keeping %.2f GiB free; cache uses %.2f GiB), "
+                         "not caching more tensors for this client\n", __func__, space.available / 1073741824.0,
+                         RPC_CACHE_DISK_RESERVE / 1073741824.0, total / 1073741824.0);
+            }
             warned_full = true;
         }
         return false;

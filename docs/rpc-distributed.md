@@ -260,7 +260,7 @@ How it works:
   For each listed tensor it then sends `SET_TENSOR_CACHED` without waiting for the reply; the server loads the entry
   from disk. Other tensors are sent normally and stored.
 - **Eviction.** Least recently used entries go first, to stay under `--cache-size` (no fixed limit by default) and to
-  always keep 10% of the disk free. Entries listed to or used by the connected client are never evicted while it is
+  always keep 2 GiB of disk free. Entries listed to or used by the connected client are never evicted while it is
   connected; if nothing else can go, new tensors are simply not cached.
 - **Housekeeping.** Writes go to a temporary file renamed into place, so an interrupted write never leaves a truncated
   entry. At startup the server removes leftover temporary files and entries of the previous cache format (64-bit FNV
@@ -601,7 +601,7 @@ bit-flipped payloads under AddressSanitizer and UBSan.
 
 - **No security.** No authentication or encryption; use a tunnel or VPN. The weight cache is content-addressed with a
   cryptographic digest computed by the server, so clients cannot poison each other's entries, but any client can fill
-  the cache with data of its own (bounded by `--cache-size` and the 10% free-disk rule).
+  the cache with data of its own (bounded by `--cache-size` and the free-disk reserve).
 - **Both sides must run this build** to use compression. Older peers interoperate without compression.
 - **Logits from a remote output layer** are large and lossless. `-bs` avoids them for generation (see
   [Remote output layer](#remote-output-layer-sample-on-the-server--bs)) but is experimental in llama.cpp and does not

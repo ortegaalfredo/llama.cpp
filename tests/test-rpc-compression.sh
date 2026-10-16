@@ -28,8 +28,9 @@ wait_for_port() {
     return 1
 }
 
-# server level / client level / level the connection must negotiate
-# ("default" starts the server without --compression: it accepts any level)
+# server level / client level / level the connection must negotiate / extra
+# server arguments ("default" starts the server without --compression: it
+# accepts any level)
 cases=(
     "none none none"
     "zstd zstd zstd"
@@ -41,16 +42,21 @@ cases=(
     "none q4 none"
     "q4 zstd zstd"
     "fp8 fp4 q8"
+    "q8 q8 q8 --cache-size 0.001"
 )
 for c in "${cases[@]}"; do
-    read -r srv_level cli_level expected <<< "$c"
-    echo "=== server: $srv_level, client: $cli_level, expected: $expected ==="
+    read -r srv_level cli_level expected extra <<< "$c"
+    echo "=== server: $srv_level $extra, client: $cli_level, expected: $expected ==="
     srv_args=()
+    if [ -n "$extra" ]; then
+        read -r -a srv_args <<< "$extra"
+    fi
     if [ "$srv_level" != "default" ]; then
-        srv_args=(--compression "$srv_level")
+        srv_args+=(--compression "$srv_level")
     fi
     log="$test_dir/server-$srv_level-$cli_level.log"
-    env -u GGML_RPC_COMPRESSION "$server" --device CPU --host 127.0.0.1 --port "$port" "${srv_args[@]}" >"$log" 2>&1 &
+    # the weight cache goes to the test's own directory
+    env -u GGML_RPC_COMPRESSION LLAMA_CACHE="$test_dir/cache" "$server" --device CPU --host 127.0.0.1 --port "$port" "${srv_args[@]}" >"$log" 2>&1 &
     pid=$!
     if ! wait_for_port; then
         echo "server did not start"

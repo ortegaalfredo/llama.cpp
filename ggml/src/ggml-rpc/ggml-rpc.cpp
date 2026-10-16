@@ -676,10 +676,11 @@ public:
 
     // whether the server's disk cache holds an entry with this digest. The
     // list of entries is fetched once, on first use, so a model load costs a
-    // single round trip for the cache however many tensors it has.
+    // single round trip for the cache however many tensors it has. Only the
+    // server's list counts: those entries are protected from eviction for the
+    // whole connection, while a store requested now may be refused (full
+    // cache or disk), so it must not be assumed to exist.
     bool cache_contains(const rpc_digest & digest);
-    // records an entry the server is about to store
-    void cache_add(const rpc_digest & digest);
     // async send whose response is a single status byte, checked by the
     // dispatcher: a failure aborts
     void send_async_checked(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size);
@@ -886,11 +887,6 @@ bool rpc_dispatcher::cache_contains(const rpc_digest & digest) {
         LOG_DBG("[%s] server cache holds %zu entries\n", __func__, cache_entries.size());
     }
     return cache_entries.count(digest) > 0;
-}
-
-void rpc_dispatcher::cache_add(const rpc_digest & digest) {
-    std::lock_guard<std::mutex> lock(cache_mutex);
-    cache_entries.insert(digest);
 }
 
 ggml_backend_event_t rpc_dispatcher::event_new(ggml_backend_dev_t dev) {
@@ -1254,7 +1250,9 @@ static bool rpc_set_tensor_from_cache(const std::shared_ptr<rpc_dispatcher> & di
         LOG_DBG2("[%s] tensor: %s, cache hit %s\n", __func__, rpc_log_format_tensor(tensor).c_str(), digest.hex().c_str());
         return true;
     }
-    dispatcher->cache_add(digest);
+    // not on the server's list: send the data and ask the server to store it
+    // (a duplicate tensor later in this load is sent again, since the store
+    // may be refused)
     flags |= RPC_SET_TENSOR_FLAG_CACHE;
     return false;
 }

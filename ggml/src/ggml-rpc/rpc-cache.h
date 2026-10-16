@@ -9,8 +9,8 @@
 // place of another model's tensor, and the server always names entries from
 // its own digest of the data it received.
 //
-// The cache keeps its size under an optional limit and always leaves 10% of
-// the disk free, evicting the least recently used entries. Entries a client
+// The cache keeps its size under an optional limit and always leaves 2 GiB
+// of disk free, evicting the least recently used entries. Entries a client
 // has been told about (list) or has used in the current connection are never
 // evicted during that connection.
 
@@ -51,7 +51,7 @@ rpc_digest rpc_cache_digest(const void * data, size_t size);
 
 class rpc_disk_cache {
 public:
-    // max_bytes = 0: no fixed limit (the 10% free disk rule still applies)
+    // max_bytes = 0: no fixed limit (the free disk reserve still applies)
     rpc_disk_cache(const std::string & dir, uint64_t max_bytes);
 
     // starts a client connection: entries protected for the previous

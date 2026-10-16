@@ -99,7 +99,7 @@ make another client's model load different data. When a client loads a model it 
 once and then sets every cached tensor without waiting for replies, so a warm load costs a single extra round trip.
 
 The least recently used entries are evicted to keep the cache under `--cache-size GiB` (default: no fixed limit) and to
-always leave 10% of the disk free; entries used by the connected client are never evicted while it is connected.
+always leave 2 GiB of disk free; entries used by the connected client are never evicted while it is connected.
 
 ```bash
 $ bin/ggml-rpc-server --cache-size 200      # keep the cache under 200 GiB
