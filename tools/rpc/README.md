@@ -83,6 +83,12 @@ $ llama-cli -hf ggml-org/gemma-3-1b-it-GGUF -ngl 99 --rpc 192.168.88.10:50052,19
 By default, llama.cpp distributes model weights and the KV cache across all available devices -- both local and remote -- in proportion to each device's available memory.
 You can override this behavior with the `--tensor-split` option and set custom proportions when splitting tensor data across devices.
 
+### Transport compression
+
+Tensor data is compressed on the wire: lossless zstd by default, and optionally lossy quantization of activations
+(`GGML_RPC_COMPRESSION=q8|q6|q4`) for slow links such as the internet. Weights, the KV cache and logits always stay
+lossless. See [docs/rpc-distributed.md](../../docs/rpc-distributed.md) for levels, measurements and examples.
+
 ### Local cache
 
 The RPC server can use a local cache to store large tensors and avoid transferring them over the network.

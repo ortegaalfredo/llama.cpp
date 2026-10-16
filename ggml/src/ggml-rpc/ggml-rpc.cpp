@@ -4,6 +4,7 @@
 #include "ggml-cpp.h"
 #include "transport.h"
 #include "log.h"
+#include "rpc-compress.h"
 
 #include <array>
 #include <chrono>
@@ -385,12 +386,8 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
     return sock->flush();
 }
 
-// RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // RPC response: | response_size (8 bytes) | response_data (response_size bytes) |
-static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
-    if (!send_rpc_cmd(sock, cmd, input, input_size)) {
-        return false;
-    }
+static bool recv_rpc_response(socket_ptr sock, void * output, size_t output_size) {
     uint64_t out_size;
     if (!sock->recv_data(&out_size, sizeof(out_size))) {
         return false;
@@ -398,10 +395,27 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
     if (out_size != output_size) {
         return false;
     }
-    if (!sock->recv_data(output, output_size)) {
+    return sock->recv_data(output, output_size);
+}
+
+// Same as above, but the response size is not known a priori (the payload may
+// be compressed), so it is received into a vector sized from the wire.
+static bool recv_rpc_response_vector(socket_ptr sock, std::vector<uint8_t> & output) {
+    uint64_t out_size;
+    if (!sock->recv_data(&out_size, sizeof(out_size))) {
         return false;
     }
-    return true;
+    if (out_size > MAX_CHUNK_SIZE) {
+        return false;
+    }
+    output.resize(out_size);
+    return sock->recv_data(output.data(), out_size);
+}
+
+// RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
+// RPC response: | response_size (8 bytes) | response_data (response_size bytes) |
+static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
+    return send_rpc_cmd(sock, cmd, input, input_size) && recv_rpc_response(sock, output, output_size);
 }
 
 // RPC client-side implementation
@@ -417,14 +431,130 @@ static inline void rpc_cpu_relax() {
 #endif
 }
 
+// conn_caps layout used by the compression negotiation. The RDMA transport
+// consumes the whole caps array (rdma_caps is exactly RPC_CONN_CAPS_SIZE
+// bytes: qpn, psn, gid), so the compression level only gets a byte of its own
+// when the RDMA transport is not compiled in. With RDMA, compression stays
+// disabled: RDMA is for local networks, where compression buys nothing.
+#ifdef GGML_RPC_RDMA
+static constexpr size_t RPC_CAPS_COMP_OFF = SIZE_MAX;   // no byte available
+#else
+static constexpr size_t RPC_CAPS_COMP_OFF = RPC_CONN_CAPS_SIZE - 1;
+#endif
+
+// the caps byte carries the codec set version in the high nibble and the
+// level in the low nibble, so a peer with a different codec set (including
+// earlier builds of this feature) negotiates RPC_COMP_NONE instead of
+// misreading payloads
+static void rpc_caps_set_comp(uint8_t * caps, uint8_t level) {
+    if (RPC_CAPS_COMP_OFF == SIZE_MAX) {
+        return;
+    }
+    caps[RPC_CAPS_COMP_OFF] = (uint8_t) ((RPC_COMP_CAPS_VERSION << 4) | (level & 0xf));
+}
+
+static uint8_t rpc_caps_get_comp(const uint8_t * caps) {
+    if (RPC_CAPS_COMP_OFF == SIZE_MAX) {
+        return RPC_COMP_NONE;
+    }
+    const uint8_t v = caps[RPC_CAPS_COMP_OFF];
+    if ((v >> 4) != RPC_COMP_CAPS_VERSION) {
+        return RPC_COMP_NONE;
+    }
+    return v & 0xf;
+}
+
+// the level both sides must use: the more conservative of the two, so a
+// lossy level never gets applied unless both peers accept it
+static uint8_t rpc_comp_negotiate(uint8_t local, uint8_t remote) {
+    if (!rpc_compress_level_valid(local) || !rpc_compress_level_valid(remote)) {
+        return RPC_COMP_NONE;
+    }
+    return local < remote ? local : remote;
+}
+
+// The most aggressive level allowed for a payload of `size` bytes of
+// `tensor`, given the level negotiated for the connection. Lossy levels are
+// only allowed for activations:
+//  - float tensors in a compute buffer (never weights, never the KV cache,
+//    which lives in a buffer with usage ANY)
+//  - rows at least RPC_COMP_MIN_ROW wide, and a payload of whole rows
+//  - for reads, not a graph output: everything the application reads back
+//    after a compute (logits, embeddings, ...) must be flagged as an output
+//    so the allocator does not reuse its memory, while the scheduler's own
+//    copies between backends read intermediate tensors that are not
+// Everything else is sent losslessly.
+static uint8_t rpc_payload_level(uint8_t negotiated, const ggml_tensor * tensor, size_t size, bool is_read) {
+    if (!rpc_compress_level_lossy(negotiated)) {
+        return negotiated;
+    }
+    const bool lossy_ok =
+        tensor->buffer != nullptr &&
+        ggml_backend_buffer_get_usage(tensor->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+        (tensor->type == GGML_TYPE_F32 || tensor->type == GGML_TYPE_F16 || tensor->type == GGML_TYPE_BF16) &&
+        tensor->ne[0] >= RPC_COMP_MIN_ROW &&
+        size % ggml_row_size(tensor->type, tensor->ne[0]) == 0 &&
+        !(is_read && (tensor->flags & GGML_TENSOR_FLAG_OUTPUT));
+    return lossy_ok ? negotiated : (uint8_t) RPC_COMP_ZSTD;
+}
+
+// row length handed to the lossy codecs
+static uint32_t rpc_payload_row_len(const ggml_tensor * tensor) {
+    return tensor->ne[0] <= UINT32_MAX ? (uint32_t) tensor->ne[0] : 0;
+}
+
+// input serialization format: | rpc_tensor | flags (1 byte) | offset (8 bytes) | data (size bytes)
+// bit 0 of the flags byte is the hash-cache flag, bit 1 marks a compressed
+// payload (see rpc-compress.h for the wire format of the data section).
+static constexpr uint8_t RPC_SET_TENSOR_FLAG_CACHE     = 0x01;
+static constexpr uint8_t RPC_SET_TENSOR_FLAG_COMPRESSED = 0x02;
+
+// When compression is negotiated, GET_TENSOR / GET_TENSOR_2D requests carry
+// the most aggressive level the client allows for that payload: the server
+// cannot tell activations from weights or outputs on its own.
+struct rpc_msg_get_tensor_comp_req {
+    rpc_msg_get_tensor_req req;
+    uint64_t               level;
+};
+
+struct rpc_msg_get_tensor_2d_comp_req {
+    rpc_msg_get_tensor_2d_req req;
+    uint64_t                  level;
+};
+
+// Unpacks a GET_TENSOR / GET_TENSOR_2D response received with compression
+// negotiated: | flags (1 byte) | data |, where data is compressed when the
+// compressed bit is set and raw otherwise.
+static void rpc_unpack_get_response(const std::vector<uint8_t> & wire, void * out, size_t out_size,
+                                    enum ggml_type type, enum rpc_cmd cmd) {
+    if (wire.empty()) {
+        GGML_ABORT("empty %s response\n", rpc_cmd_name(cmd));
+    }
+    if (wire[0] & RPC_SET_TENSOR_FLAG_COMPRESSED) {
+        if (!rpc_decompress_payload(out, out_size, wire.data() + 1, wire.size() - 1, type)) {
+            GGML_ABORT("failed to decompress %s response\n", rpc_cmd_name(cmd));
+        }
+        LOG_DBG3("[%s] %s decompressed %s -> %s\n", __func__, rpc_cmd_name(cmd),
+                 rpc_log_format_size(wire.size() - 1).c_str(), rpc_log_format_size(out_size).c_str());
+    } else {
+        if (wire.size() != 1 + out_size) {
+            GGML_ABORT("unexpected %s response size: %zu (expected %zu)\n", rpc_cmd_name(cmd), wire.size(), 1 + out_size);
+        }
+        memcpy(out, wire.data() + 1, out_size);
+    }
+}
+
 // Performs HELLO handshake with transport auto-negotiation.
 // Advertises local capabilities via conn_caps; if the server responds with
 // matching capabilities, the socket is upgraded transparently.
-static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
+// `comp_level` receives the compression level negotiated with the server.
+static bool negotiate_hello(const std::shared_ptr<socket_t> & sock, uint8_t & comp_level) {
     rpc_msg_hello_req request = {};
     rpc_msg_hello_rsp response = {};
 
     sock->get_caps(request.conn_caps);
+    const uint8_t local_comp = rpc_compress_env_level();
+    rpc_caps_set_comp(request.conn_caps, local_comp);
 
     bool status = send_rpc_cmd(sock, RPC_CMD_HELLO, &request, sizeof(request), &response, sizeof(response));
     RPC_STATUS_ASSERT(status);
@@ -436,8 +566,12 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
     }
 
     sock->update_caps(response.conn_caps);
-    LOG_DBG("[%s] handshake ok: server version %d.%d.%d, transport: %s\n",
-            __func__, response.major, response.minor, response.patch, sock->transport_name());
+
+    // compression is negotiated down to the level both sides support
+    comp_level = rpc_comp_negotiate(local_comp, rpc_caps_get_comp(response.conn_caps));
+    LOG_DBG("[%s] handshake ok: server version %d.%d.%d, transport: %s, compression: %s\n",
+            __func__, response.major, response.minor, response.patch, sock->transport_name(),
+            rpc_compress_level_name(comp_level));
     return true;
 }
 
@@ -496,10 +630,22 @@ public:
     rpc_dispatcher() {
     }
 
+    // compression level negotiated with the server in the HELLO handshake.
+    // RPC_COMP_NONE means every payload goes over the wire unchanged.
+    uint8_t comp_level = RPC_COMP_NONE;
+
     void send(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size);
     void send(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size);
     void send_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size);
     void send_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size);
+    // blocking send whose response is received into a vector; used for
+    // GET_TENSOR responses, which may be compressed and therefore have an
+    // unknown wire size
+    void send_recv_vector(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, std::vector<uint8_t> & output);
+    // async variant: the response is received into a buffer owned by the
+    // message and decompressed into `output` by the dispatcher thread
+    void send_async_recv_decompressed(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size,
+                                      void * output, size_t output_size, enum ggml_type tensor_type);
 
     ggml_backend_event_t event_new(ggml_backend_dev_t dev);
     void event_free(ggml_backend_event_t event);
@@ -512,6 +658,7 @@ public:
 
     void start(const std::string & endpoint);
     void work();
+    void receive_work();
 
     ~rpc_dispatcher();
 
@@ -522,7 +669,21 @@ private:
         size_t                        input_size;
         void                        * output;
         size_t                        output_size;
+        // when set, the response is received into this vector instead of
+        // `output` (used for possibly-compressed GET_TENSOR responses)
+        std::vector<uint8_t>        * recv_vector = nullptr;
+        // async variant: the response is received into a buffer owned by the
+        // message and then decompressed into `output` by the dispatcher
+        // thread, before the completion event fires
+        std::vector<uint8_t>          recv_buf = {};
+        enum ggml_type                tensor_type = GGML_TYPE_F32;
+        bool                          decompress_into_output = false;
         std::promise<void>            completion;
+        std::chrono::steady_clock::time_point t_sent = {};
+
+        bool expects_response() const {
+            return recv_vector != nullptr || decompress_into_output || output != nullptr;
+        }
     };
     using rpc_msg_ptr   = std::shared_ptr<rpc_msg>;
     using rpc_msg_queue = message_queue<rpc_msg_ptr>;
@@ -532,12 +693,30 @@ private:
     };
     std::mutex graph_mutex;
     std::unordered_map<uint32_t, std::unordered_set<uint64_t>> graph_uids;
+    // receives the response of msg (if it has one) and completes it
+    void finish(const rpc_msg_ptr & msg);
+    // waits for the next message, spinning while busy spinning is requested
+    // and commands keep coming
+    bool next(rpc_msg_queue & q, rpc_msg_ptr & msg, std::chrono::steady_clock::time_point & last);
+
     rpc_msg_queue    queue;
     socket_ptr       sock;
     std::atomic_uint busy_spin_users = 0;
     std::atomic_bool running;
     std::thread      thread;
+    // Request pipelining (TCP only). The worker thread sends each request as
+    // soon as it is queued and hands the message to `inflight`; the receiver
+    // thread reads the responses in the same order and completes the
+    // messages. Several reads queued back to back (e.g. the outputs of
+    // backend sampling) then cost one network round trip instead of one each.
+    // The server handles commands strictly in order, so responses arrive in
+    // request order. Without pipelining the worker does both, one command at
+    // a time.
+    bool             pipelined = false;
+    rpc_msg_queue    inflight;
+    std::thread      recv_thread;
 };
+
 
 static void rpc_dispatcher_trampoline(rpc_dispatcher * dispatcher)
 {
@@ -585,6 +764,40 @@ void rpc_dispatcher::send_async(enum rpc_cmd cmd, std::shared_ptr<const void> in
     msg->input_size = input_size;
     msg->output = output;
     msg->output_size = output_size;
+    GGML_ASSERT(queue.push(msg));
+}
+
+// Blocking send whose response is received into a vector. Used for GET_TENSOR
+// responses, which may be compressed and therefore have an unknown wire size.
+void rpc_dispatcher::send_recv_vector(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size,
+                                      std::vector<uint8_t> & output) {
+    auto msg = std::make_shared<rpc_msg>();
+    msg->cmd = cmd;
+    msg->input = input;
+    msg->input_size = input_size;
+    msg->output = nullptr;
+    msg->output_size = 0;
+    msg->recv_vector = &output;
+    GGML_ASSERT(queue.push(msg));
+    auto future = msg->completion.get_future();
+    future.wait();
+}
+
+// Async variant of the above: the response is received into a buffer owned by
+// the message, then decompressed into `output` by the dispatcher thread. The
+// caller's buffer is only touched after the decompression succeeded, and the
+// completion event fires after that, so the usual event-synchronize
+// discipline is enough to make the write visible.
+void rpc_dispatcher::send_async_recv_decompressed(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size,
+                                                  void * output, size_t output_size, enum ggml_type tensor_type) {
+    auto msg = std::make_shared<rpc_msg>();
+    msg->cmd = cmd;
+    msg->input = input;
+    msg->input_size = input_size;
+    msg->output = output;
+    msg->output_size = output_size;
+    msg->tensor_type = tensor_type;
+    msg->decompress_into_output = true;
     GGML_ASSERT(queue.push(msg));
 }
 
@@ -649,49 +862,93 @@ void rpc_dispatcher::start(const std::string & endpoint) {
     if (sock == nullptr) {
         GGML_ABORT("Failed to connect to %s\n", endpoint.c_str());
     }
-    if (!negotiate_hello(sock)) {
+    if (!negotiate_hello(sock, comp_level)) {
         GGML_ABORT("RPC handshake failed for %s\n", endpoint.c_str());
     }
-    LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
+    // the TCP transport sends and receives with plain send()/recv() on the
+    // socket, which may run concurrently from two threads; RDMA keeps the
+    // single-threaded path
+    pipelined = strcmp(sock->transport_name(), "TCP") == 0 && std::getenv("GGML_RPC_NO_PIPELINE") == nullptr;
+    LOG_DBG("[%s] connected to %s, pipelining: %s\n", __func__, endpoint.c_str(), pipelined ? "on" : "off");
     running = true;
     thread = std::thread(rpc_dispatcher_trampoline, this);
+    if (pipelined) {
+        recv_thread = std::thread([this] { receive_work(); });
+    }
+}
+
+bool rpc_dispatcher::next(rpc_msg_queue & q, rpc_msg_ptr & msg, std::chrono::steady_clock::time_point & last) {
+    while (running) {
+        // spin only while commands keep coming, so an idle dispatcher does not keep a core busy
+        const bool spin = busy_spin_users.load(std::memory_order_relaxed) != 0 &&
+                          std::chrono::steady_clock::now() - last < RPC_BUSY_SPIN_IDLE_TIME;
+        if (!spin) {
+            return q.pop(&msg);
+        }
+        if (q.try_pop(&msg)) {
+            return true;
+        }
+        rpc_cpu_relax();
+    }
+    return false;
+}
+
+void rpc_dispatcher::finish(const rpc_msg_ptr & msg) {
+    if (msg->cmd != RPC_CMD_NONE && msg->expects_response()) {
+        bool status;
+        if (msg->recv_vector) {
+            status = recv_rpc_response_vector(sock, *msg->recv_vector);
+        } else if (msg->decompress_into_output) {
+            status = recv_rpc_response_vector(sock, msg->recv_buf);
+            if (status) {
+                // the server prefixes a flags byte when compression was
+                // negotiated; unpack the payload into the caller's buffer
+                rpc_unpack_get_response(msg->recv_buf, msg->output, msg->output_size, msg->tensor_type, msg->cmd);
+                msg->recv_buf = {};
+            }
+        } else {
+            status = recv_rpc_response(sock, msg->output, msg->output_size);
+        }
+        RPC_STATUS_ASSERT(status);
+    }
+    if (msg->cmd != RPC_CMD_NONE && rpc_log_debug_level() >= 3) {
+        const std::chrono::duration<double, std::milli> elapsed = std::chrono::steady_clock::now() - msg->t_sent;
+        LOG_DBG3("[%s] %s done in %.3f ms\n", __func__, rpc_cmd_name(msg->cmd), elapsed.count());
+    } else if (msg->cmd == RPC_CMD_NONE) {
+        LOG_DBG3("[%s] sync barrier\n", __func__);
+    }
+    msg->completion.set_value();
 }
 
 void rpc_dispatcher::work() {
     auto last_cmd = std::chrono::steady_clock::now();
-    while (running) {
-        rpc_msg_ptr msg_ptr;
-        // spin only while commands keep coming, so an idle dispatcher does not keep a core busy
-        const bool spin = busy_spin_users.load(std::memory_order_relaxed) != 0 &&
-                          std::chrono::steady_clock::now() - last_cmd < RPC_BUSY_SPIN_IDLE_TIME;
-        if (spin) {
-            if (!queue.try_pop(&msg_ptr)) {
-                rpc_cpu_relax();
-                continue;
-            }
-        } else if (!queue.pop(&msg_ptr)) {
-            break;
-        }
+    rpc_msg_ptr msg_ptr;
+    while (next(queue, msg_ptr, last_cmd)) {
         if (msg_ptr->cmd != RPC_CMD_NONE) {
             LOG_DBG2("[%s] %s (in: %s, out: %s)\n", __func__, rpc_cmd_name(msg_ptr->cmd),
                      rpc_log_format_size(msg_ptr->input_size).c_str(), rpc_log_format_size(msg_ptr->output_size).c_str());
-            const bool trace = rpc_log_debug_level() >= 3;
-            const auto t0 = std::chrono::steady_clock::now();
-            if (msg_ptr->output) {
-                bool status = send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size, msg_ptr->output, msg_ptr->output_size);
-                RPC_STATUS_ASSERT(status);
-            } else {
-                bool status = send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size);
-                RPC_STATUS_ASSERT(status);
-            }
-            if (trace) {
-                const std::chrono::duration<double, std::milli> elapsed = std::chrono::steady_clock::now() - t0;
-                LOG_DBG3("[%s] %s done in %.3f ms\n", __func__, rpc_cmd_name(msg_ptr->cmd), elapsed.count());
-            }
-        } else {
-            LOG_DBG3("[%s] sync barrier\n", __func__);
+            msg_ptr->t_sent = std::chrono::steady_clock::now();
+            bool status = send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size);
+            RPC_STATUS_ASSERT(status);
         }
-        msg_ptr->completion.set_value();
+        if (pipelined) {
+            // barriers go through the receiver too, so they complete only
+            // after every earlier response has arrived
+            GGML_ASSERT(inflight.push(msg_ptr));
+        } else {
+            finish(msg_ptr);
+        }
+        msg_ptr = nullptr;
+        last_cmd = std::chrono::steady_clock::now();
+    }
+}
+
+void rpc_dispatcher::receive_work() {
+    auto last_cmd = std::chrono::steady_clock::now();
+    rpc_msg_ptr msg_ptr;
+    while (next(inflight, msg_ptr, last_cmd)) {
+        finish(msg_ptr);
+        msg_ptr = nullptr;
         last_cmd = std::chrono::steady_clock::now();
     }
 }
@@ -699,10 +956,14 @@ void rpc_dispatcher::work() {
 rpc_dispatcher::~rpc_dispatcher() {
     running = false;
     queue.interrupt();
-    sock = nullptr;
+    inflight.interrupt();
     if (thread.joinable()) {
         thread.join();
     }
+    if (recv_thread.joinable()) {
+        recv_thread.join();
+    }
+    sock = nullptr;
 }
 
 static std::shared_ptr<rpc_dispatcher> get_dispatcher(const std::string & endpoint) {
@@ -825,17 +1086,35 @@ static void ggml_backend_rpc_buffer_memset_tensor(
     ctx->dispatcher->send(RPC_CMD_MEMSET_TENSOR, request, sizeof(*request));
 }
 
-// input serialization format: | rpc_tensor | cache_flag (1 byte) | offset (8 bytes) | data (size bytes)
-static std::shared_ptr<uint8_t> serialize_set_tensor(const rpc_tensor & rpc_tensor, uint8_t cache_flag, uint64_t offset, const void * data, size_t size, size_t & input_size) {
-    input_size = sizeof(rpc_tensor) + sizeof(cache_flag) + sizeof(offset) + size;
+static std::shared_ptr<uint8_t> serialize_set_tensor(const rpc_tensor & rpc_tensor, uint8_t flags, uint64_t offset, const void * data, size_t size, size_t & input_size) {
+    input_size = sizeof(rpc_tensor) + sizeof(flags) + sizeof(offset) + size;
     uint8_t * input = new uint8_t[input_size]();
     uint8_t * p = input;
     memcpy(p, &rpc_tensor, sizeof(rpc_tensor)); p += sizeof(rpc_tensor);
-    memcpy(p, &cache_flag, sizeof(cache_flag)); p += sizeof(cache_flag);
-    memcpy(p, &offset,     sizeof(offset));     p += sizeof(offset);
+    memcpy(p, &flags, sizeof(flags)); p += sizeof(flags);
+    memcpy(p, &offset, sizeof(offset));     p += sizeof(offset);
     memcpy(p, data, size);
     return std::shared_ptr<uint8_t>(input, std::default_delete<uint8_t[]>());
 }
+
+// Same as serialize_set_tensor, but the data section is compressed at up to
+// `level` (see rpc_payload_level) when that makes it smaller; the compressed
+// bit of the flags byte tells the server which form it gets.
+static std::shared_ptr<uint8_t> serialize_set_tensor_compressed(const ggml_tensor * tensor, const rpc_tensor & rpc_tensor,
+                                                                uint8_t flags, uint64_t offset, const void * data, size_t size,
+                                                                uint8_t level, size_t & input_size) {
+    std::vector<uint8_t> wire;
+    const uint8_t codec = rpc_compress_payload(wire, data, size, tensor->type, rpc_payload_row_len(tensor), level);
+    if (codec != RPC_CODEC_RAW) {
+        flags |= RPC_SET_TENSOR_FLAG_COMPRESSED;
+        LOG_DBG3("[%s] tensor %s compressed %s -> %s (codec %u)\n", __func__, rpc_tensor.name,
+                 rpc_log_format_size(size).c_str(), rpc_log_format_size(wire.size()).c_str(), codec);
+        return serialize_set_tensor(rpc_tensor, flags, offset, wire.data(), wire.size(), input_size);
+    }
+    // incompressible or compression disabled: send raw
+    return serialize_set_tensor(rpc_tensor, flags, offset, data, size, input_size);
+}
+
 
 // the hash cache is meant for weights, so that a model reload can skip re-sending them.
 // compute-buffer inputs (the activations ggml_backend_sched copies between backends) must not
@@ -848,7 +1127,7 @@ static bool rpc_use_hash_cache(const ggml_tensor * tensor, size_t size) {
 static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
-    uint8_t cache_flag = 0;
+    uint8_t flags = 0;
     LOG_DBG2("[%s] tensor: %s, offset: %zu, size: %s\n", __func__, rpc_log_format_tensor(tensor).c_str(), offset,
              rpc_log_format_size(size).c_str());
     if (rpc_use_hash_cache(tensor, size)) {
@@ -865,10 +1144,11 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
             return;
         }
         // the server has no cache entry for this tensor - ask it to save one
-        cache_flag = 1;
+        flags = RPC_SET_TENSOR_FLAG_CACHE;
     }
     size_t input_size;
-    auto input = serialize_set_tensor(rpc_tensor, cache_flag, offset, data, size, input_size);
+    const uint8_t level = rpc_payload_level(ctx->dispatcher->comp_level, tensor, size, false);
+    auto input = serialize_set_tensor_compressed(tensor, rpc_tensor, flags, offset, data, size, level, input_size);
     ctx->dispatcher->send(RPC_CMD_SET_TENSOR, input, input_size);
 }
 
@@ -878,18 +1158,51 @@ static void ggml_backend_rpc_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, 
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
     LOG_DBG2("[%s] tensor: %s, offset: %zu, size: %s, n_copies: %zu, stride: %zu\n", __func__,
              rpc_log_format_tensor(tensor).c_str(), offset, rpc_log_format_size(size).c_str(), n_copies, stride_tensor);
-    // input serialization format: | rpc_tensor | offset (8 bytes) | size (8 bytes) | n_copies (8 bytes) | stride (8 bytes) | data (size * n_copies bytes) |
-    size_t input_size = sizeof(rpc_tensor) + 4*sizeof(uint64_t) + size*n_copies;
+    // input serialization format: | rpc_tensor | offset (8) | size (8) | n_copies (8) | stride (8) | data |
+    // When compression is negotiated, a flags byte is inserted after the
+    // header and the data section may be compressed (see rpc-compress.h).
+    // Peers that negotiated RPC_COMP_NONE use the original format, so mixed
+    // versions stay compatible.
+    const uint64_t header[4] = { offset, size, n_copies, stride_tensor };
+    const size_t header_size = sizeof(rpc_tensor) + 4*sizeof(uint64_t);
+
+    // gather the strided copies into one contiguous buffer first
+    std::vector<uint8_t> gathered(size*n_copies);
+    for (size_t i = 0; i < n_copies; i++) {
+        memcpy(gathered.data() + i*size, (const char *)data + i*stride_data, size);
+    }
+
+    const bool compress = ctx->dispatcher->comp_level != RPC_COMP_NONE;
+    std::vector<uint8_t> wire;
+    uint8_t flags = 0;
+    if (compress) {
+        // every copy must be whole rows for the lossy codecs: checking the
+        // per-copy size covers the gathered total too
+        const uint8_t level = rpc_payload_level(ctx->dispatcher->comp_level, tensor, size, false);
+        const uint8_t codec = rpc_compress_payload(wire, gathered.data(), gathered.size(), tensor->type,
+                                                   rpc_payload_row_len(tensor), level);
+        if (codec != RPC_CODEC_RAW) {
+            flags = RPC_SET_TENSOR_FLAG_COMPRESSED;
+            LOG_DBG3("[%s] tensor %s compressed %s -> %s (codec %u)\n", __func__, rpc_tensor.name,
+                     rpc_log_format_size(gathered.size()).c_str(), rpc_log_format_size(wire.size()).c_str(), codec);
+        }
+        // incompressible: fall through and send the gathered bytes raw
+    }
+    const void * payload = (flags & RPC_SET_TENSOR_FLAG_COMPRESSED) ? (const void *)wire.data() : (const void *)gathered.data();
+    const size_t payload_size = (flags & RPC_SET_TENSOR_FLAG_COMPRESSED) ? wire.size() : gathered.size();
+
+    size_t input_size = header_size + (compress ? 1 : 0) + payload_size;
     uint8_t * input = new uint8_t[input_size]();
     uint8_t * dest = input;
     memcpy(dest, &rpc_tensor, sizeof(rpc_tensor));
     dest += sizeof(rpc_tensor);
-    uint64_t header[4] = { offset, size, n_copies, stride_tensor };
     memcpy(dest, header, sizeof(header));
     dest += sizeof(header);
-    for (size_t i = 0; i < n_copies; i++) {
-        memcpy(dest + i*size, (const char *)data + i*stride_data, size);
+    if (compress) {
+        *dest = flags;
+        dest += 1;
     }
+    memcpy(dest, payload, payload_size);
     std::shared_ptr<uint8_t> input_ptr(input, std::default_delete<uint8_t[]>());
     ctx->dispatcher->send(RPC_CMD_SET_TENSOR_2D, input_ptr, input_size);
 }
@@ -905,13 +1218,33 @@ static void ggml_backend_rpc_buffer_get_tensor_2d(ggml_backend_buffer_t buffer, 
     request->size     = size;
     request->n_copies = n_copies;
     request->stride   = stride_tensor;
+    const size_t total = size*n_copies;
+    if (ctx->dispatcher->comp_level == RPC_COMP_NONE) {
+        if (stride_data == size) {
+            ctx->dispatcher->send(RPC_CMD_GET_TENSOR_2D, request, sizeof(*request), data, total);
+        } else {
+            std::vector<uint8_t> packed(total);
+            ctx->dispatcher->send(RPC_CMD_GET_TENSOR_2D, request, sizeof(*request), packed.data(), packed.size());
+            for (size_t i = 0; i < n_copies; i++) {
+                memcpy((char *)data + i*stride_data, packed.data() + i*size, size);
+            }
+        }
+        return;
+    }
+    // the response may be compressed, so its wire size is unknown: receive
+    // into a scratch vector, decompress, then scatter the copies
+    auto comp_request = std::make_shared<rpc_msg_get_tensor_2d_comp_req>();
+    comp_request->req   = *request;
+    comp_request->level = rpc_payload_level(ctx->dispatcher->comp_level, tensor, size, true);
+    std::vector<uint8_t> wire;
+    ctx->dispatcher->send_recv_vector(RPC_CMD_GET_TENSOR_2D, comp_request, sizeof(*comp_request), wire);
+    std::vector<uint8_t> plain(total);
+    rpc_unpack_get_response(wire, plain.data(), total, tensor->type, RPC_CMD_GET_TENSOR_2D);
     if (stride_data == size) {
-        ctx->dispatcher->send(RPC_CMD_GET_TENSOR_2D, request, sizeof(*request), data, size*n_copies);
+        memcpy(data, plain.data(), total);
     } else {
-        std::vector<uint8_t> packed(size*n_copies);
-        ctx->dispatcher->send(RPC_CMD_GET_TENSOR_2D, request, sizeof(*request), packed.data(), packed.size());
         for (size_t i = 0; i < n_copies; i++) {
-            memcpy((char *)data + i*stride_data, packed.data() + i*size, size);
+            memcpy((char *)data + i*stride_data, plain.data() + i*size, size);
         }
     }
 }
@@ -924,7 +1257,18 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
     request->tensor = serialize_tensor(tensor);
     request->offset = offset;
     request->size = size;
-    ctx->dispatcher->send(RPC_CMD_GET_TENSOR, request, sizeof(*request), data, size);
+    if (ctx->dispatcher->comp_level == RPC_COMP_NONE) {
+        ctx->dispatcher->send(RPC_CMD_GET_TENSOR, request, sizeof(*request), data, size);
+        return;
+    }
+    // the response may be compressed, so its wire size is unknown: receive
+    // into a scratch vector, then decompress into the caller's buffer
+    auto comp_request = std::make_shared<rpc_msg_get_tensor_comp_req>();
+    comp_request->req   = *request;
+    comp_request->level = rpc_payload_level(ctx->dispatcher->comp_level, tensor, size, true);
+    std::vector<uint8_t> wire;
+    ctx->dispatcher->send_recv_vector(RPC_CMD_GET_TENSOR, comp_request, sizeof(*comp_request), wire);
+    rpc_unpack_get_response(wire, data, size, tensor->type, RPC_CMD_GET_TENSOR);
 }
 
 static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
@@ -1169,7 +1513,8 @@ static void ggml_backend_rpc_set_tensor_async(ggml_backend_t backend, ggml_tenso
         cache_flag = 1;
     }
     size_t input_size;
-    auto input = serialize_set_tensor(rpc_tensor, cache_flag, offset, data, size, input_size);
+    const uint8_t level = rpc_payload_level(ctx->dispatcher->comp_level, tensor, size, false);
+    auto input = serialize_set_tensor_compressed(tensor, rpc_tensor, cache_flag, offset, data, size, level, input_size);
     ctx->dispatcher->send_async(RPC_CMD_SET_TENSOR, input, input_size);
 }
 
@@ -1181,7 +1526,17 @@ static void ggml_backend_rpc_get_tensor_async(ggml_backend_t backend, const ggml
     request->tensor = serialize_tensor(tensor);
     request->offset = offset;
     request->size = size;
-    ctx->dispatcher->send_async(RPC_CMD_GET_TENSOR, request, sizeof(*request), data, size);
+    if (ctx->dispatcher->comp_level == RPC_COMP_NONE) {
+        ctx->dispatcher->send_async(RPC_CMD_GET_TENSOR, request, sizeof(*request), data, size);
+        return;
+    }
+    // the response may be compressed, so its wire size is unknown: receive
+    // into a buffer owned by the message, then decompress into `data`
+    auto comp_request = std::make_shared<rpc_msg_get_tensor_comp_req>();
+    comp_request->req   = *request;
+    comp_request->level = rpc_payload_level(ctx->dispatcher->comp_level, tensor, size, true);
+    ctx->dispatcher->send_async_recv_decompressed(RPC_CMD_GET_TENSOR, comp_request, sizeof(*comp_request), data, size,
+                                                  tensor->type);
 }
 
 static void ggml_backend_rpc_synchronize(ggml_backend_t backend) {
@@ -1392,7 +1747,14 @@ public:
         stored_graphs.resize(backends.size());
         comm_states.resize(backends.size());
     }
+
+    // compression level negotiated with the client in the HELLO handshake
+    uint8_t comp_level = RPC_COMP_NONE;
     ~rpc_server();
+
+    // with compression negotiated, prefixes `response` (the plain tensor
+    // bytes) with a flags byte and compresses it if that makes it smaller
+    void compress_response(std::vector<uint8_t> & response, uint8_t level, const rpc_tensor & tensor) const;
 
     void hello(rpc_msg_hello_rsp & response);
     bool alloc_buffer(const rpc_msg_alloc_buffer_req & request, rpc_msg_alloc_buffer_rsp & response);
@@ -1405,8 +1767,10 @@ public:
     bool set_tensor(const std::vector<uint8_t> & input);
     bool set_tensor_2d(const std::vector<uint8_t> & input);
     bool set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response);
-    bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
-    bool get_tensor_2d(const rpc_msg_get_tensor_2d_req & request, std::vector<uint8_t> & response);
+    // `level` is the most aggressive compression level the client allows for
+    // the response (capped by the negotiated level)
+    bool get_tensor(const rpc_msg_get_tensor_req & request, uint8_t level, std::vector<uint8_t> & response);
+    bool get_tensor_2d(const rpc_msg_get_tensor_2d_req & request, uint8_t level, std::vector<uint8_t> & response);
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
     bool graph_compute(const std::vector<uint8_t> & input);
     bool graph_recompute(const rpc_msg_graph_recompute_req & request);
@@ -1697,17 +2061,19 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
 
 bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
     sync_all_backends();
-    // serialization format: | rpc_tensor | cache_flag (1 byte) | offset (8 bytes) | data (size bytes) |
-    uint8_t  cache_flag;
+    // serialization format: | rpc_tensor | flags (1 byte) | offset (8 bytes) | data (size bytes) |
+    // bit 1 of the flags byte marks a compressed data section.
+    uint8_t  flags;
     uint64_t offset;
-    const size_t header_size = sizeof(rpc_tensor) + sizeof(cache_flag) + sizeof(offset);
+    const size_t header_size = sizeof(rpc_tensor) + sizeof(flags) + sizeof(offset);
     if (input.size() < header_size) {
         return false;
     }
     const rpc_tensor * in_tensor = (const rpc_tensor *)input.data();
-    memcpy(&cache_flag, input.data() + sizeof(rpc_tensor), sizeof(cache_flag));
-    memcpy(&offset,     input.data() + sizeof(rpc_tensor) + sizeof(cache_flag), sizeof(offset));
-    const size_t size = input.size() - header_size;
+    memcpy(&flags,  input.data() + sizeof(rpc_tensor), sizeof(flags));
+    memcpy(&offset, input.data() + sizeof(rpc_tensor) + sizeof(flags), sizeof(offset));
+    const bool compressed = (flags & RPC_SET_TENSOR_FLAG_COMPRESSED) != 0;
+    const size_t wire_size = input.size() - header_size;
 
     struct ggml_init_params params {
         /*.mem_size   =*/ ggml_tensor_overhead(),
@@ -1722,6 +2088,20 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
         LOG_ERROR("[%s] error deserializing tensor\n", __func__);
         return false;
     }
+    // the size of the write: for a compressed payload, the uncompressed size
+    // from its header. It is only trusted after the bounds check below, and
+    // nothing is allocated before that.
+    const void * data = input.data() + header_size;
+    size_t size = wire_size;
+    if (compressed) {
+        uint64_t orig_size = 0;
+        if (comp_level == RPC_COMP_NONE || !rpc_compressed_orig_size(data, wire_size, orig_size) || orig_size > SIZE_MAX) {
+            LOG_ERROR("[%s] invalid compressed payload\n", __func__);
+            return false;
+        }
+        size = (size_t) orig_size;
+    }
+
     LOG_DBG2("[%s] tensor: %s, buffer: %p, data: %p, offset: %" PRIu64 ", size: %s\n",
             __func__, rpc_log_format_tensor(tensor).c_str(), (void*)tensor->buffer, tensor->data, offset,
             rpc_log_format_size(size).c_str());
@@ -1738,8 +2118,26 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
         }
     }
 
-    const void * data = input.data() + header_size;
-    if (cache_dir && cache_flag) {
+    // decompress: everything downstream (hash cache, the write) works on the
+    // plain bytes
+    std::vector<uint8_t> plain;
+    if (compressed) {
+        try {
+            plain.resize(size);
+        } catch (const std::bad_alloc &) {
+            LOG_ERROR("[%s] failed to allocate %zu bytes\n", __func__, size);
+            return false;
+        }
+        if (!rpc_decompress_payload(plain.data(), size, data, wire_size, (enum ggml_type) in_tensor->type)) {
+            LOG_ERROR("[%s] failed to decompress payload for tensor %s\n", __func__, in_tensor->name);
+            return false;
+        }
+        LOG_DBG3("[%s] tensor %s decompressed %s -> %s\n", __func__, in_tensor->name,
+                 rpc_log_format_size(wire_size).c_str(), rpc_log_format_size(size).c_str());
+        data = plain.data();
+    }
+
+    if (cache_dir && (flags & RPC_SET_TENSOR_FLAG_CACHE)) {
         uint64_t hash = fnv_hash((const uint8_t*)data, size);
         char hash_str[17];
         snprintf(hash_str, sizeof(hash_str), "%016" PRIx64, hash);
@@ -1755,8 +2153,12 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
 
 bool rpc_server::set_tensor_2d(const std::vector<uint8_t> & input) {
     sync_all_backends();
-    // serialization format: | rpc_tensor | offset (8 bytes) | size (8 bytes) | n_copies (8 bytes) | stride (8 bytes) | data (size * n_copies bytes) |
-    if (input.size() < sizeof(rpc_tensor) + 4*sizeof(uint64_t)) {
+    // serialization format: | rpc_tensor | offset (8) | size (8) | n_copies (8) | stride (8) | data |
+    // When compression was negotiated, a flags byte follows the header and
+    // the data section may be compressed (see rpc-compress.h). A peer that
+    // negotiated RPC_COMP_NONE (or an older version) sends no flags byte.
+    const size_t header_size = sizeof(rpc_tensor) + 4*sizeof(uint64_t);
+    if (input.size() < header_size) {
         return false;
     }
     const rpc_tensor * in_tensor = (const rpc_tensor *)input.data();
@@ -1767,10 +2169,20 @@ bool rpc_server::set_tensor_2d(const std::vector<uint8_t> & input) {
     const uint64_t n_copies = header[2];
     const uint64_t stride   = header[3];
 
-    const uint64_t data_size = input.size() - sizeof(rpc_tensor) - 4*sizeof(uint64_t);
-    if (n_copies == 0 || size == 0 || size > data_size / n_copies || size * n_copies != data_size) {
+    if (n_copies == 0 || size == 0 || size > UINT64_MAX / n_copies) {
         return false;
     }
+    const uint64_t payload_size = size * n_copies;
+
+    // when compression is negotiated the flags byte is always present
+    const bool has_flags = comp_level != RPC_COMP_NONE;
+    const size_t data_off = header_size + (has_flags ? 1 : 0);
+    if (input.size() < data_off) {
+        return false;
+    }
+    uint8_t flags = has_flags ? input[header_size] : 0;
+    const bool compressed = (flags & RPC_SET_TENSOR_FLAG_COMPRESSED) != 0;
+    const uint64_t wire_size = input.size() - data_off;
 
     struct ggml_init_params params {
         /*.mem_size   =*/ ggml_tensor_overhead(),
@@ -1810,7 +2222,38 @@ bool rpc_server::set_tensor_2d(const std::vector<uint8_t> & input) {
         }
     }
 
-    const void * data = input.data() + sizeof(rpc_tensor) + 4*sizeof(uint64_t);
+    // decompress the data section first: everything downstream works on the
+    // plain bytes. The uncompressed size must match size*n_copies exactly.
+    std::vector<uint8_t> plain;
+    const void * data;
+    if (compressed) {
+        // with overlapping copies (stride < size) the bounds check above does
+        // not limit size*n_copies, so cap it by the destination buffer before
+        // allocating: a legitimate write never carries more than that
+        if (wire_size < RPC_COMP_HEADER_SIZE || payload_size > ggml_backend_buffer_get_size(tensor->buffer)) {
+            LOG_ERROR("[%s] invalid compressed payload\n", __func__);
+            return false;
+        }
+        try {
+            plain.resize(payload_size);
+        } catch (const std::bad_alloc &) {
+            LOG_ERROR("[%s] failed to allocate %" PRIu64 " bytes\n", __func__, payload_size);
+            return false;
+        }
+        if (!rpc_decompress_payload(plain.data(), plain.size(), input.data() + data_off, wire_size,
+                                    (enum ggml_type) in_tensor->type)) {
+            LOG_ERROR("[%s] failed to decompress payload for tensor %s\n", __func__, in_tensor->name);
+            return false;
+        }
+        data = plain.data();
+        LOG_DBG3("[%s] tensor %s decompressed %s -> %s\n", __func__, in_tensor->name,
+                 rpc_log_format_size(wire_size).c_str(), rpc_log_format_size(payload_size).c_str());
+    } else {
+        if (wire_size != payload_size) {
+            return false;
+        }
+        data = input.data() + data_off;
+    }
     ggml_backend_tensor_set_2d(tensor, data, offset, size, n_copies, stride, size);
     return true;
 }
@@ -1919,7 +2362,7 @@ bool rpc_server::init_tensor(const rpc_msg_init_tensor_req & request) {
     return true;
 }
 
-bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response) {
+bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, uint8_t level, std::vector<uint8_t> & response) {
     sync_all_backends();
     struct ggml_init_params params {
         /*.mem_size   =*/ ggml_tensor_overhead(),
@@ -1954,10 +2397,29 @@ bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<
 
     response.resize(request.size, 0);
     ggml_backend_tensor_get(tensor, response.data(), request.offset, request.size);
+    compress_response(response, level, request.tensor);
     return true;
 }
 
-bool rpc_server::get_tensor_2d(const rpc_msg_get_tensor_2d_req & request, std::vector<uint8_t> & response) {
+void rpc_server::compress_response(std::vector<uint8_t> & response, uint8_t level, const rpc_tensor & tensor) const {
+    if (comp_level == RPC_COMP_NONE) {
+        return;
+    }
+    std::vector<uint8_t> wire;
+    const uint8_t codec = rpc_compress_payload(wire, response.data(), response.size(), (enum ggml_type) tensor.type,
+                                               tensor.ne[0], std::min(level, comp_level));
+    if (codec != RPC_CODEC_RAW) {
+        LOG_DBG3("[%s] tensor %s compressed %s -> %s (codec %u)\n", __func__, tensor.name,
+                 rpc_log_format_size(response.size()).c_str(), rpc_log_format_size(wire.size()).c_str(), codec);
+        // the compressed payload starts with its own header; make room for the flags byte
+        wire.insert(wire.begin(), RPC_SET_TENSOR_FLAG_COMPRESSED);
+        response.swap(wire);
+    } else {
+        response.insert(response.begin(), 0);
+    }
+}
+
+bool rpc_server::get_tensor_2d(const rpc_msg_get_tensor_2d_req & request, uint8_t level, std::vector<uint8_t> & response) {
     sync_all_backends();
     struct ggml_init_params params {
         /*.mem_size   =*/ ggml_tensor_overhead(),
@@ -2003,6 +2465,7 @@ bool rpc_server::get_tensor_2d(const rpc_msg_get_tensor_2d_req & request, std::v
 
     response.resize(request.size * request.n_copies, 0);
     ggml_backend_tensor_get_2d(tensor, response.data(), request.offset, request.size, request.n_copies, request.stride, request.size);
+    compress_response(response, level, request.tensor);
     return true;
 }
 
@@ -2464,13 +2927,19 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
     server.hello(rsp);
     // Advertise server transport capabilities based on client's caps
     sock->get_caps(rsp.conn_caps);
+    const uint8_t local_comp = rpc_compress_env_level();
+    rpc_caps_set_comp(rsp.conn_caps, local_comp);
     if (!send_msg(sock, &rsp, sizeof(rsp))) {
         return;
     }
 
     // Activate transport upgrade using client's caps
     sock->update_caps(req.conn_caps);
-    LOG_DBG("[%s] client connected, transport: %s\n", __func__, sock->transport_name());
+
+    // compression is negotiated down to the level both sides support
+    server.comp_level = rpc_comp_negotiate(local_comp, rpc_caps_get_comp(req.conn_caps));
+    LOG_INFO("client connected, transport: %s, compression: %s\n", sock->transport_name(),
+             rpc_compress_level_name(server.comp_level));
     while (true) {
         if (!sock->recv_data(&cmd, 1)) {
             break;
@@ -2618,12 +3087,21 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 break;
             }
             case RPC_CMD_GET_TENSOR_2D: {
-                rpc_msg_get_tensor_2d_req request;
-                if (!recv_msg(sock, &request, sizeof(request))) {
+                // with compression negotiated the request carries the level
+                // the client allows for the response
+                rpc_msg_get_tensor_2d_comp_req request = {};
+                if (server.comp_level != RPC_COMP_NONE) {
+                    if (!recv_msg(sock, &request, sizeof(request))) {
+                        return;
+                    }
+                } else if (!recv_msg(sock, &request.req, sizeof(request.req))) {
+                    return;
+                }
+                if (request.level >= RPC_COMP_COUNT) {
                     return;
                 }
                 std::vector<uint8_t> response;
-                if (!server.get_tensor_2d(request, response)) {
+                if (!server.get_tensor_2d(request.req, (uint8_t) request.level, response)) {
                     return;
                 }
                 if (!send_msg(sock, response.data(), response.size())) {
@@ -2656,12 +3134,21 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 break;
             }
             case RPC_CMD_GET_TENSOR: {
-                rpc_msg_get_tensor_req request;
-                if (!recv_msg(sock, &request, sizeof(request))) {
+                // with compression negotiated the request carries the level
+                // the client allows for the response
+                rpc_msg_get_tensor_comp_req request = {};
+                if (server.comp_level != RPC_COMP_NONE) {
+                    if (!recv_msg(sock, &request, sizeof(request))) {
+                        return;
+                    }
+                } else if (!recv_msg(sock, &request.req, sizeof(request.req))) {
+                    return;
+                }
+                if (request.level >= RPC_COMP_COUNT) {
                     return;
                 }
                 std::vector<uint8_t> response;
-                if (!server.get_tensor(request, response)) {
+                if (!server.get_tensor(request.req, (uint8_t) request.level, response)) {
                     return;
                 }
                 if (!send_msg(sock, response.data(), response.size())) {

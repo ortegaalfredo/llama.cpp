@@ -4,10 +4,24 @@ ggml_add_backend_library(ggml-rpc
                          ggml-rpc.cpp
                          log.cpp
                          transport.cpp
+                         rpc-compress.cpp
                         )
 
 if (WIN32)
     target_link_libraries(ggml-rpc PRIVATE ws2_32)
+endif()
+
+# transport compression (see rpc-compress.{h,cpp}). zstd backs the lossless
+# level and the lossless fallback of the lossy levels; without it compression
+# is disabled and the peer is told so during the handshake.
+find_path(ZSTD_INCLUDE_DIR NAMES zstd.h)
+find_library(ZSTD_LIB NAMES zstd)
+if (ZSTD_INCLUDE_DIR AND ZSTD_LIB)
+    target_include_directories(ggml-rpc PRIVATE ${ZSTD_INCLUDE_DIR})
+    target_link_libraries(ggml-rpc PRIVATE ${ZSTD_LIB})
+    target_compile_definitions(ggml-rpc PRIVATE GGML_RPC_HAVE_ZSTD)
+else()
+    message(WARNING "ggml-rpc: zstd not found, RPC transport compression disabled")
 endif()
 
 # RDMA auto-detection: Linux RoCE/IB via libibverbs, Apple RDMA-over-Thunderbolt via librdma

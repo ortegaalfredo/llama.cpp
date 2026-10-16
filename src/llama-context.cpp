@@ -2902,13 +2902,28 @@ private:
 
 class llama_io_write_host : public llama_io_write_i {
 public:
+    // `backends` (optional) are the context's backends, used to batch the tensor reads
     llama_io_write_host(
-            uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
+            uint8_t * p, size_t len, const std::vector<ggml_backend_ptr> * backends = nullptr) : ptr(p), buf_size(len), backends(backends) {}
 
     ~llama_io_write_host() {
-        // TODO: add backend support to batch tensor_get? or some other way to speed this up
+        // issue the reads asynchronously on the backend that owns each buffer and wait once per
+        // backend at the end: a remote (RPC) backend then sends them back to back, so they share
+        // one network round trip instead of costing one each
+        std::vector<ggml_backend_t> used;
         for (const auto & winfo : winfos) {
-            ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
+            ggml_backend_t backend = backend_for(winfo.tensor->buffer);
+            if (backend == nullptr) {
+                ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
+                continue;
+            }
+            ggml_backend_tensor_get_async(backend, winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
+            if (std::find(used.begin(), used.end(), backend) == used.end()) {
+                used.push_back(backend);
+            }
+        }
+        for (ggml_backend_t backend : used) {
+            ggml_backend_synchronize(backend);
         }
     }
 
@@ -2940,9 +2955,26 @@ public:
     }
 
 private:
+    // the backend whose device owns buf, when buf is that device's default buffer type (the
+    // only kind every backend's async get accepts); nullptr to read synchronously
+    ggml_backend_t backend_for(ggml_backend_buffer_t buf) const {
+        if (backends == nullptr || buf == nullptr) {
+            return nullptr;
+        }
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf);
+        for (const auto & backend : *backends) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+            if (dev != nullptr && ggml_backend_dev_buffer_type(dev) == buft) {
+                return backend.get();
+            }
+        }
+        return nullptr;
+    }
+
     uint8_t * ptr;
     size_t buf_size = 0;
     size_t size_written = 0;
+    const std::vector<ggml_backend_ptr> * backends;
 
     struct write_info {
         ggml_tensor * tensor;
@@ -3377,7 +3409,7 @@ size_t llama_context::state_get_size() {
 }
 
 size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
-    llama_io_write_host io(dst, size);
+    llama_io_write_host io(dst, size, &backends);
     try {
         return state_write_data(io);
     } catch (const std::exception & err) {
@@ -3417,7 +3449,7 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         io = std::make_unique<llama_io_write_device>(dst, size, mem_storage[seq_id]);
     } else {
-        io = std::make_unique<llama_io_write_host>(dst, size);
+        io = std::make_unique<llama_io_write_host>(dst, size, &backends);
     }
 
     try {

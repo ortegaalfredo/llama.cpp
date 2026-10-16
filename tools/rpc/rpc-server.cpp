@@ -97,6 +97,10 @@ struct rpc_server_params {
     bool                     use_cache   = false;
     int                      n_threads   = std::max(1U, std::thread::hardware_concurrency()/2);
     std::vector<std::string> devices;
+    // most aggressive transport compression level accepted from clients (see
+    // rpc-compress.h); the client picks the level it wants up to this one.
+    // Empty: GGML_RPC_COMPRESSION if set, otherwise every level.
+    std::string              compression;
 };
 
 static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
@@ -108,6 +112,10 @@ static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
     fprintf(stderr, "  -H, --host HOST                  host to bind to (default: %s)\n", params.host.c_str());
     fprintf(stderr, "  -p, --port PORT                  port to bind to (default: %d)\n", params.port);
     fprintf(stderr, "  -c, --cache                      enable local file cache\n");
+    fprintf(stderr, "  -z, --compression LEVEL          most aggressive transport compression accepted from clients:\n");
+    fprintf(stderr, "                                   none, zstd, q8, q6, q4 (default: q4, i.e. whatever the client asks)\n");
+    fprintf(stderr, "                                   zstd is lossless; q8/q6/q4 quantize activations on the wire to\n");
+    fprintf(stderr, "                                   ~8.4/~6.4/~4.6 bits per value (weights, KV cache and outputs stay lossless)\n");
     fprintf(stderr, "\n");
 }
 
@@ -127,6 +135,17 @@ static bool rpc_server_params_parse(int argc, char ** argv, rpc_server_params & 
             params.n_threads = std::stoi(argv[i]);
             if (params.n_threads <= 0) {
                 fprintf(stderr, "error: invalid number of threads: %d\n", params.n_threads);
+                return false;
+            }
+        } else if (arg == "-z" || arg == "--compression") {
+            if (++i >= argc) {
+                return false;
+            }
+            params.compression = argv[i];
+            static const char * levels[] = { "none", "zstd", "q8", "q6", "q4", "fp8", "fp4" };
+            if (std::find_if(std::begin(levels), std::end(levels),
+                             [&](const char * l) { return params.compression == l; }) == std::end(levels)) {
+                fprintf(stderr, "error: invalid compression level: %s (none, zstd, q8, q6, q4)\n", params.compression.c_str());
                 return false;
             }
         } else if (arg == "-d" || arg == "--device") {
@@ -230,6 +249,20 @@ int main(int argc, char * argv[]) {
         fprintf(stderr, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
         fprintf(stderr, "\n");
     }
+
+    // the compression level is read from the environment by the RPC backend
+    // (see rpc-compress.h), so apply the flag before the server starts. A
+    // server accepts every level by default: the client decides how much
+    // accuracy it trades for bandwidth.
+    if (params.compression.empty()) {
+        const char * env = getenv("GGML_RPC_COMPRESSION");
+        params.compression = (env != nullptr && env[0] != '\0') ? env : "q4";
+    }
+#ifdef _WIN32
+    _putenv_s("GGML_RPC_COMPRESSION", params.compression.c_str());
+#else
+    setenv("GGML_RPC_COMPRESSION", params.compression.c_str(), 1);
+#endif
 
     auto devices = get_devices(params);
     if (devices.empty()) {
