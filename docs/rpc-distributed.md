@@ -93,8 +93,11 @@ for scripts written for the earlier version of this feature.
 
 ## What gets compressed
 
-Only the tensor data paths (`SET_TENSOR`, `SET_TENSOR_2D`, `GET_TENSOR`, `GET_TENSOR_2D`) are compressed; control
-messages are a few hundred bytes and stay as they are. The client decides per payload:
+The tensor data paths (`SET_TENSOR`, `SET_TENSOR_2D`, `GET_TENSOR`, `GET_TENSOR_2D`) are compressed in both
+directions, and so are graph descriptions (`GRAPH_COMPUTE`, lossless zstd, ~16x smaller), which are sent whenever the
+graph changes shape. Other control messages are a few hundred bytes and stay as they are. Not compressed: the direct
+server-to-server exchange of tensor-parallel split (`-sm tensor`), which keeps its own bf16 encoding. The client
+decides per tensor payload:
 
 | Payload | Codec |
 |---------|-------|
@@ -567,8 +570,9 @@ The decoder reconstructs the values in the tensor's own type (f32, f16 or bf16).
 Intended for maintainers; protocol version stays 8.1.0, the compression codec set has its own version.
 
 **Negotiation.** The last byte of the HELLO `conn_caps` carries `(codec_set_version << 4) | level`, codec set version
-2. A peer advertising a different version (including all-zero caps from builds without compression, or the earlier
-fp8/fp4 build) negotiates `none`. Both sides use `min(local, remote)`. Builds with the RDMA transport compiled in use
+3 (2 had uncompressed graph descriptions). A peer advertising a different version (including all-zero caps from builds
+without compression, the earlier fp8/fp4 build, or version 2) negotiates `none`, so mixed versions still work, without
+compression. Both sides use `min(local, remote)`. Builds with the RDMA transport compiled in use
 the whole caps array for RDMA and never compress.
 
 **Features.** The byte before it carries feature flags; bit 0 (`RPC_FEAT_CACHE`) means the server has a disk cache and
@@ -586,6 +590,11 @@ purpose. **SET_TENSOR_2D**: when compression was negotiated, a flags byte follow
 **GET_TENSOR / GET_TENSOR_2D**: when compression was negotiated, the request carries an extra `u64 level` - the most
 aggressive level the client allows for that payload (the server cannot tell activations from weights or outputs) - and
 the response is `| flags (u8) | data |`, bit 1 meaning compressed.
+
+**GRAPH_COMPUTE**: when compression was negotiated, `| flags (u8) | serialized graph |`, the graph zstd-compressed
+(as a compressed payload) when bit 1 is set. A new graph is sent whenever its shape changes (e.g. between prompt
+processing and generation); zstd shrinks it ~16x (215 KiB -> 13 KiB for Qwen3-0.6B). Unchanged graphs are reused by id
+(`GRAPH_RECOMPUTE`, 12 bytes).
 
 **Compressed payload**: `| codec (u8) | uncompressed size (u64) | body |`
 

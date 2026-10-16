@@ -1731,6 +1731,20 @@ void rpc_dispatcher::graph_compute(uint32_t device, const ggml_cgraph * cgraph) 
         uint8_t * input = serialize_graph(device, cgraph, this, &input_size);
         LOG_DBG2("[%s] serialized graph: %s\n", __func__, rpc_log_format_size(input_size).c_str());
         std::shared_ptr<uint8_t> input_ptr(input, std::default_delete<uint8_t[]>());
+        if (comp_level != RPC_COMP_NONE) {
+            // with compression negotiated: | flags (u8) | graph |, the graph
+            // zstd-compressed when the compressed bit is set. A new graph is
+            // about 1 MiB and is sent whenever the graph changes shape.
+            std::vector<uint8_t> wire;
+            const bool compressed = rpc_compress_payload(wire, input, input_size, GGML_TYPE_I8, 0, RPC_COMP_ZSTD) != RPC_CODEC_RAW;
+            const size_t payload_size = compressed ? wire.size() : input_size;
+            uint8_t * msg = new uint8_t[1 + payload_size];
+            msg[0] = compressed ? RPC_SET_TENSOR_FLAG_COMPRESSED : 0;
+            memcpy(msg + 1, compressed ? wire.data() : input, payload_size);
+            LOG_DBG2("[%s] graph on the wire: %s\n", __func__, rpc_log_format_size(1 + payload_size).c_str());
+            input_ptr.reset(msg, std::default_delete<uint8_t[]>());
+            input_size = 1 + payload_size;
+        }
         send_async(RPC_CMD_GRAPH_COMPUTE, input_ptr, input_size);
     }
 }
@@ -3316,6 +3330,33 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, rpc_d
                 std::vector<uint8_t> input;
                 if (!recv_msg(sock, input)) {
                     return;
+                }
+                if (server.comp_level != RPC_COMP_NONE) {
+                    // | flags (u8) | graph, zstd-compressed when the compressed bit is set |
+                    if (input.empty()) {
+                        return;
+                    }
+                    std::vector<uint8_t> graph;
+                    if (input[0] & RPC_SET_TENSOR_FLAG_COMPRESSED) {
+                        uint64_t orig_size = 0;
+                        if (!rpc_compressed_orig_size(input.data() + 1, input.size() - 1, orig_size) || orig_size > MAX_CHUNK_SIZE) {
+                            LOG_ERROR("[%s] invalid compressed graph\n", __func__);
+                            return;
+                        }
+                        try {
+                            graph.resize(orig_size);
+                        } catch (const std::bad_alloc &) {
+                            LOG_ERROR("[%s] failed to allocate %" PRIu64 " bytes for the graph\n", __func__, orig_size);
+                            return;
+                        }
+                        if (!rpc_decompress_payload(graph.data(), graph.size(), input.data() + 1, input.size() - 1, GGML_TYPE_I8)) {
+                            LOG_ERROR("[%s] failed to decompress graph\n", __func__);
+                            return;
+                        }
+                    } else {
+                        graph.assign(input.begin() + 1, input.end());
+                    }
+                    input.swap(graph);
                 }
                 if (!server.graph_compute(input)) {
                     return;

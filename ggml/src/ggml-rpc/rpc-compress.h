@@ -76,7 +76,7 @@ static constexpr uint32_t RPC_COMP_MIN_ROW = 256;
 // The level is advertised in one byte of the HELLO conn_caps: the high nibble
 // is the version of the codec set, the low nibble the level. A peer with a
 // different codec set (or none) negotiates RPC_COMP_NONE.
-static constexpr uint8_t RPC_COMP_CAPS_VERSION = 2;
+static constexpr uint8_t RPC_COMP_CAPS_VERSION = 3; // 3: compressed graph descriptions
 
 static inline bool rpc_compress_level_valid(uint8_t level) {
     return level < RPC_COMP_COUNT;
