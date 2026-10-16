@@ -984,6 +984,25 @@ struct common_gguf_info {
 common_gguf_info common_get_gguf_info(const std::string & fname);
 
 // note: defines the model, context, samplers, ets. lifetimes
+// Console progress of a model load: a line every few seconds with a bar, how
+// much of the model is loaded, the speed and the ETA, then a final line. Loads
+// that finish within a few seconds print nothing. Useful when the weights go
+// to RPC servers over a slow network.
+struct common_load_progress {
+    std::string what = "loading model"; // printed in front of each line
+    double      total_bytes = 0;        // approximate model size, 0 if unknown
+    int64_t     t_start_us  = 0;
+    int64_t     t_last_us   = 0;
+    bool        printed     = false;
+    bool        done        = false;
+};
+
+// total size of a model's files, including the other parts of a split model
+double common_model_files_size(const std::string & path);
+
+// to be called from a llama_progress_callback with its progress (0..1)
+void common_load_progress_update(common_load_progress & st, float progress);
+
 struct common_init_result {
     common_init_result(common_params & params, bool model_only = false);
     ~common_init_result();

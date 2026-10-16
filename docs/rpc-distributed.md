@@ -266,6 +266,16 @@ How it works:
   entry. At startup the server removes leftover temporary files and entries of the previous cache format (64-bit FNV
   names), which can never be used again.
 
+**Progress.** Loads that take more than a few seconds print a line every 5 s (`llama-server`, `llama-cli`,
+`llama-completion` and the other tools built on `common`), then a summary:
+
+```
+loading text_model [#########-----------]  49% 2.28/4.68 GiB, 111.3 MiB/s, ETA 0m22s
+loading text_model: done in 0m46s (103.5 MiB/s)
+```
+
+With `-v`, the loader also reports per server how much was sent and how much came from the server's cache.
+
 **Stored digests: no local reading either.** The main host also remembers the digest of every tensor it uploads, in
 a small index per model file under `$LLAMA_CACHE/rpc-digests/` (default `~/.cache/llama.cpp/rpc-digests/`). When the
 model is loaded again, the loader looks a tensor up there before reading it; if the server's cache holds that digest,

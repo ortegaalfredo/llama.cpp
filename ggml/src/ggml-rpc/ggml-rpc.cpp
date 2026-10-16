@@ -1257,7 +1257,8 @@ static bool rpc_set_tensor_from_cache(const std::shared_ptr<rpc_dispatcher> & di
     return false;
 }
 
-static void rpc_buffer_set_tensor_impl(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset,
+// returns true when the tensor was set from the server's cache
+static bool rpc_buffer_set_tensor_impl(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset,
                                        size_t size, rpc_digest * digest_out) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
@@ -1265,12 +1266,13 @@ static void rpc_buffer_set_tensor_impl(ggml_backend_buffer_t buffer, ggml_tensor
     LOG_DBG2("[%s] tensor: %s, offset: %zu, size: %s\n", __func__, rpc_log_format_tensor(tensor).c_str(), offset,
              rpc_log_format_size(size).c_str());
     if (rpc_set_tensor_from_cache(ctx->dispatcher, tensor, rpc_tensor, offset, data, size, flags, digest_out)) {
-        return;
+        return true;
     }
     size_t input_size;
     const uint8_t level = rpc_payload_level(ctx->dispatcher->comp_level, tensor, size, false);
     auto input = serialize_set_tensor_compressed(tensor, rpc_tensor, flags, offset, data, size, level, input_size);
     ctx->dispatcher->send(RPC_CMD_SET_TENSOR, input, input_size);
+    return false;
 }
 
 static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
@@ -3757,8 +3759,13 @@ static bool ggml_backend_rpc_set_tensor_cached(struct ggml_tensor * tensor, size
 // Uploads like ggml_backend_tensor_set and writes the cache digest it computed
 // to `digest` (32 bytes). Returns false when no digest was computed (not an
 // RPC buffer, no server cache, or a tensor too small to cache); the tensor is
-// uploaded either way.
-static bool ggml_backend_rpc_set_tensor_digest(struct ggml_tensor * tensor, const void * data, size_t offset, size_t size, uint8_t * digest) {
+// uploaded either way. `from_cache` (optional) tells whether the server set
+// it from its cache instead of receiving the data.
+static bool ggml_backend_rpc_set_tensor_digest(struct ggml_tensor * tensor, const void * data, size_t offset, size_t size,
+                                               uint8_t * digest, bool * from_cache) {
+    if (from_cache != nullptr) {
+        *from_cache = false;
+    }
     if (tensor->buffer == nullptr || !ggml_backend_buffer_is_rpc(tensor->buffer)) {
         ggml_backend_tensor_set(tensor, data, offset, size);
         return false;
@@ -3766,7 +3773,10 @@ static bool ggml_backend_rpc_set_tensor_digest(struct ggml_tensor * tensor, cons
     auto * ctx = (ggml_backend_rpc_buffer_context *) tensor->buffer->context;
     const bool cacheable = rpc_tensor_cacheable(ctx->dispatcher, tensor, size);
     rpc_digest d;
-    rpc_buffer_set_tensor_impl(tensor->buffer, tensor, data, offset, size, cacheable ? &d : nullptr);
+    const bool hit = rpc_buffer_set_tensor_impl(tensor->buffer, tensor, data, offset, size, cacheable ? &d : nullptr);
+    if (from_cache != nullptr) {
+        *from_cache = hit;
+    }
     if (cacheable) {
         memcpy(digest, d.b.data(), sizeof(d.b));
     }

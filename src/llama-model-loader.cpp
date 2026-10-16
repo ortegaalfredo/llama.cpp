@@ -1842,19 +1842,47 @@ bool llama_model_loader::load_all_data(
         ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf));
         return dev != nullptr && ggml_backend_dev_backend_reg(dev) == rpc_reg;
     };
+    size_t rpc_n_cached     = 0;
+    size_t rpc_bytes_cached = 0;
     // uploads a tensor's data; for RPC weights, also records the digest
     auto upload = [&](ggml_tensor * cur, const auto * weight, const void * data, size_t n_size, bool rpc_weight) {
         if (rpc_weight && rpc_set_digest != nullptr) {
             uint8_t digest[32];
-            if (rpc_set_digest(cur, data, 0, n_size, digest)) {
+            bool from_cache = false;
+            if (rpc_set_digest(cur, data, 0, n_size, digest, &from_cache)) {
                 rpc_index(weight->idx).add(weight->offs, n_size, digest);
+            }
+            if (from_cache) {
+                rpc_bytes_cached += n_size;
             }
         } else {
             ggml_backend_tensor_set(cur, data, 0, n_size);
         }
     };
-    size_t rpc_n_cached     = 0;
-    size_t rpc_bytes_cached = 0;
+    // summary of the uploads to RPC servers (the periodic progress of the
+    // whole load is up to the progress callback)
+    size_t      rpc_total = 0;
+    size_t      rpc_done  = 0;
+    std::string rpc_name;
+    for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != nullptr; cur = ggml_get_next_tensor(ctx, cur)) {
+        if (get_weight(ggml_get_name(cur)) != nullptr && is_rpc_buffer(cur->buffer)) {
+            rpc_total += ggml_nbytes(cur);
+            if (rpc_name.empty()) {
+                rpc_name = ggml_backend_buft_name(ggml_backend_buffer_get_type(cur->buffer));
+            }
+        }
+    }
+    const int64_t t_rpc_start = ggml_time_us();
+    auto rpc_summary = [&]() {
+        if (rpc_total == 0) {
+            return;
+        }
+        const double elapsed = (ggml_time_us() - t_rpc_start) / 1e6;
+        const double sent    = (double) (rpc_done - rpc_bytes_cached);
+        LLAMA_LOG_INFO("%s: uploaded %.2f GiB to %s in %.1f s (%.1f MiB/s sent, %.2f GiB set from the server's cache)\n",
+                       __func__, rpc_total / 1073741824.0, rpc_name.c_str(), elapsed,
+                       elapsed > 0 ? sent / elapsed / 1048576.0 : 0.0, rpc_bytes_cached / 1073741824.0);
+    };
 
     std::vector<ggml_tensor *> tensors;
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
@@ -1898,6 +1926,7 @@ bool llama_model_loader::load_all_data(
             if (digest != nullptr && rpc_set_cached(cur, 0, n_size, digest)) {
                 rpc_n_cached++;
                 rpc_bytes_cached += n_size;
+                rpc_done += n_size;
                 size_done += n_size;
                 continue;
             }
@@ -2017,8 +2046,14 @@ bool llama_model_loader::load_all_data(
             }
         }
 
+        if (rpc_weight || is_rpc_buffer(cur->buffer)) {
+            rpc_done += n_size;
+        }
+
         size_done += n_size;
     }
+
+    rpc_summary();
 
     for (auto & index : rpc_digests) {
         if (index) {

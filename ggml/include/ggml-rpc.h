@@ -31,9 +31,10 @@ GGML_BACKEND_API void ggml_backend_rpc_start_server(const char * endpoint, const
 // "ggml_backend_rpc_set_tensor_cached": sets a weight from the server's cache entry with this 32-byte digest,
 //     without its data; false when not possible (the caller then uploads the data)
 // "ggml_backend_rpc_set_tensor_digest": uploads like ggml_backend_tensor_set and writes the 32-byte cache
-//     digest it computed; false when none was computed
+//     digest it computed; false when none was computed. from_cache (optional) tells whether the server set
+//     the tensor from its cache
 typedef bool (*ggml_backend_rpc_set_tensor_cached_t)(struct ggml_tensor * tensor, size_t offset, size_t size, const uint8_t * digest);
-typedef bool (*ggml_backend_rpc_set_tensor_digest_t)(struct ggml_tensor * tensor, const void * data, size_t offset, size_t size, uint8_t * digest);
+typedef bool (*ggml_backend_rpc_set_tensor_digest_t)(struct ggml_tensor * tensor, const void * data, size_t offset, size_t size, uint8_t * digest, bool * from_cache);
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_reg(void);
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint);

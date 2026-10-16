@@ -1236,10 +1236,96 @@ common_gguf_info common_get_gguf_info(const std::string & fname) {
     return info;
 }
 
+double common_model_files_size(const std::string & path) {
+    std::error_code ec;
+    // a split model is "<prefix>-00001-of-00004.gguf", "<prefix>-00002-of-00004.gguf", ...
+    static const std::regex split_re("-([0-9]{5})-of-([0-9]{5})\\.gguf$");
+    std::smatch m;
+    if (!std::regex_search(path, m, split_re)) {
+        const auto size = std::filesystem::file_size(path, ec);
+        return ec ? 0.0 : (double) size;
+    }
+    const std::string prefix = path.substr(0, m.position(0));
+    const int n_splits = std::stoi(m[2].str());
+    double total = 0;
+    for (int i = 1; i <= n_splits; ++i) {
+        char suffix[32];
+        snprintf(suffix, sizeof(suffix), "-%05d-of-%05d.gguf", i, n_splits);
+        const auto size = std::filesystem::file_size(prefix + suffix, ec);
+        if (ec) {
+            return 0.0;
+        }
+        total += (double) size;
+    }
+    return total;
+}
+
+void common_load_progress_update(common_load_progress & st, float progress) {
+    static constexpr int64_t REPORT_INTERVAL_US = 5000000;
+    const int64_t now = ggml_time_us();
+    if (st.t_start_us == 0) {
+        st.t_start_us = now;
+        st.t_last_us  = now;
+    }
+    const bool final = progress >= 1.0f;
+    if (st.done || (!final && now - st.t_last_us < REPORT_INTERVAL_US)) {
+        return;
+    }
+    st.t_last_us = now;
+    const double elapsed = (now - st.t_start_us) / 1e6;
+    auto fmt_time = [](double sec) {
+        char buf[32];
+        const long s = (long) (sec + 0.5);
+        if (s >= 3600) {
+            snprintf(buf, sizeof(buf), "%ldh%02ldm", s / 3600, (s / 60) % 60);
+        } else {
+            snprintf(buf, sizeof(buf), "%ldm%02lds", s / 60, s % 60);
+        }
+        return std::string(buf);
+    };
+    const double rate = st.total_bytes > 0 && elapsed > 0 ? progress * st.total_bytes / elapsed : 0.0; // bytes/s
+    if (final) {
+        st.done = true;
+        if (st.printed) {
+            if (rate > 0) {
+                LOG_INF("%s: done in %s (%.1f MiB/s)\n", st.what.c_str(), fmt_time(elapsed).c_str(), rate / 1048576.0);
+            } else {
+                LOG_INF("%s: done in %s\n", st.what.c_str(), fmt_time(elapsed).c_str());
+            }
+        }
+        return;
+    }
+    char bar[21];
+    const int n_fill = std::max(0, std::min(20, (int) (progress * 20)));
+    for (int i = 0; i < 20; ++i) {
+        bar[i] = i < n_fill ? '#' : '-';
+    }
+    bar[20] = '\0';
+    const std::string eta = progress > 0.005f ? fmt_time(elapsed * (1.0 - progress) / progress) : std::string("?");
+    if (st.total_bytes > 0) {
+        LOG_INF("%s [%s] %3.0f%% %.2f/%.2f GiB, %.1f MiB/s, ETA %s\n", st.what.c_str(), bar, 100.0 * progress,
+                progress * st.total_bytes / 1073741824.0, st.total_bytes / 1073741824.0, rate / 1048576.0, eta.c_str());
+    } else {
+        LOG_INF("%s [%s] %3.0f%%, ETA %s\n", st.what.c_str(), bar, 100.0 * progress, eta.c_str());
+    }
+    st.printed = true;
+}
+
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
+
+    // without a progress callback of the caller's, report the load on the console
+    common_load_progress load_progress;
+    if (mparams.progress_callback == nullptr) {
+        load_progress.total_bytes = common_model_files_size(params.model.path);
+        mparams.progress_callback = [](float progress, void * ud) {
+            common_load_progress_update(*(common_load_progress *) ud, progress);
+            return true;
+        };
+        mparams.progress_callback_user_data = &load_progress;
+    }
 
     if (params.fit_params) {
         COM_TRC("%s", "fitting params to device memory ...\n");

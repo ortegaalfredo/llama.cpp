@@ -1084,11 +1084,15 @@ private:
         std::string stage;
         std::vector<std::string> stages;
         int64_t t_last_load_progress_ms = 0;
-        load_progress_data(server_context_impl * ctx, const std::string & stage) : ctx(ctx), stage(stage) {}
+        common_load_progress console; // progress lines on the console
+        load_progress_data(server_context_impl * ctx, const std::string & stage) : ctx(ctx), stage(stage) {
+            console.what = "loading " + stage;
+        }
     };
     static bool load_progress_callback(float progress, void * user_data) {
         auto * d = static_cast<load_progress_data *>(user_data);
         GGML_ASSERT(d);
+        common_load_progress_update(d->console, progress);
         // always emit the first and final sample; throttle the rest to one per 200ms
         {
             auto & t_last = d->t_last_load_progress_ms;
@@ -1117,6 +1121,10 @@ private:
         load_progress_data load_progress_text  (this, "text_model");
         load_progress_data load_progress_mmproj(this, "mmproj_model");
         load_progress_data load_progress_spec  (this, "spec_model");
+        load_progress_text.console.total_bytes = common_model_files_size(params.model.path);
+        if (!params.mmproj.path.empty()) {
+            load_progress_mmproj.console.total_bytes = common_model_files_size(params.mmproj.path);
+        }
 
         const bool is_resume = sleeping;
 
