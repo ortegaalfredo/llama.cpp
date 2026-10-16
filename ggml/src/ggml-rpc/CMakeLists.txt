@@ -5,6 +5,7 @@ ggml_add_backend_library(ggml-rpc
                          log.cpp
                          transport.cpp
                          rpc-compress.cpp
+                         rpc-cache.cpp
                         )
 
 if (WIN32)

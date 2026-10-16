@@ -94,7 +94,9 @@ static bool common_create_directories(const std::filesystem::path & path, std::e
 struct rpc_server_params {
     std::string              host        = "127.0.0.1";
     int                      port        = 50052;
-    bool                     use_cache   = false;
+    bool                     use_cache   = true;
+    // cache size limit in GiB, 0 = no fixed limit (10% of the disk is always kept free)
+    double                   cache_size  = 0;
     int                      n_threads   = std::max(1U, std::thread::hardware_concurrency()/2);
     std::vector<std::string> devices;
     // most aggressive transport compression level accepted from clients (see
@@ -111,7 +113,10 @@ static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
     fprintf(stderr, "  -d, --device <dev1,dev2,...>     comma-separated list of devices\n");
     fprintf(stderr, "  -H, --host HOST                  host to bind to (default: %s)\n", params.host.c_str());
     fprintf(stderr, "  -p, --port PORT                  port to bind to (default: %d)\n", params.port);
-    fprintf(stderr, "  -c, --cache                      enable local file cache\n");
+    fprintf(stderr, "  -c, --cache                      cache weights on disk so reloads skip the network (default: on)\n");
+    fprintf(stderr, "      --no-cache                   disable the weight cache\n");
+    fprintf(stderr, "      --cache-size GiB             cache size limit, least recently used entries are evicted\n");
+    fprintf(stderr, "                                   (default: 0 = no fixed limit; 10%% of the disk is always kept free)\n");
     fprintf(stderr, "  -z, --compression LEVEL          most aggressive transport compression accepted from clients:\n");
     fprintf(stderr, "                                   none, zstd, q8, q6, q4 (default: q4, i.e. whatever the client asks)\n");
     fprintf(stderr, "                                   zstd is lossless; q8/q6/q4 quantize activations on the wire to\n");
@@ -174,6 +179,17 @@ static bool rpc_server_params_parse(int argc, char ** argv, rpc_server_params & 
             }
         } else if (arg == "-c" || arg == "--cache") {
             params.use_cache = true;
+        } else if (arg == "--no-cache") {
+            params.use_cache = false;
+        } else if (arg == "--cache-size") {
+            if (++i >= argc) {
+                return false;
+            }
+            params.cache_size = std::atof(argv[i]);
+            if (params.cache_size < 0) {
+                fprintf(stderr, "error: invalid cache size: %s\n", argv[i]);
+                return false;
+            }
         } else if (arg == "-h" || arg == "--help") {
             print_usage(argc, argv, params);
             exit(0);
@@ -258,10 +274,14 @@ int main(int argc, char * argv[]) {
         const char * env = getenv("GGML_RPC_COMPRESSION");
         params.compression = (env != nullptr && env[0] != '\0') ? env : "q4";
     }
+    // the cache size limit is read by the RPC backend the same way
+    const std::string cache_size = std::to_string(params.cache_size);
 #ifdef _WIN32
     _putenv_s("GGML_RPC_COMPRESSION", params.compression.c_str());
+    _putenv_s("GGML_RPC_CACHE_SIZE", cache_size.c_str());
 #else
     setenv("GGML_RPC_COMPRESSION", params.compression.c_str(), 1);
+    setenv("GGML_RPC_CACHE_SIZE", cache_size.c_str(), 1);
 #endif
 
     auto devices = get_devices(params);

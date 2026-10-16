@@ -233,11 +233,59 @@ See [Backend sampling](#backend-sampling) for measurements.
 ### Keeping the weight upload cheap
 
 Weights are sent once per load. zstd shrinks them by 1.5-20% depending on the quantization type (IQ quants compress
-best). For repeated loads of the same model, the server-side cache avoids resending large tensors entirely:
+best). The servers also keep a disk cache of weight tensors of 1 MiB or more, **on by default**: loading the same
+model again sends almost nothing.
 
 ```bash
-build/bin/ggml-rpc-server -c --host 127.0.0.1 --port 50052
+build/bin/ggml-rpc-server --host 127.0.0.1 --port 50052 --cache-size 200   # optional limit in GiB
+build/bin/ggml-rpc-server --no-cache                                        # disable it
 ```
+
+Measured with Qwen3-8B Q4_K_M:
+
+| | uploaded to the server | at 50 Mbit/s |
+|---|---|---|
+| first load | 4,582 MB | ~12 min |
+| later loads | **2.5 MB** | < 1 s |
+
+Share of each model's weights held in tensors of 1 MiB or more: 99.98% for Qwen3-8B Q4_K_M, 99.98% for
+Qwen3.8-Flash-Next Q8_0 (32 MB of its 188 GB are sent on every load).
+
+How it works:
+
+- **Content-addressed, named by the server.** An entry's name is the digest of its data: SHA-256 over 4 MiB chunks
+  (hashed in parallel), then over the chunk digests, the size and a domain tag. The server computes it from the data
+  it received, so a client cannot make another client's model load different data.
+- **One round trip per load.** On its first cacheable tensor the client fetches the list of entries (`CACHE_LIST`).
+  For each listed tensor it then sends `SET_TENSOR_CACHED` without waiting for the reply; the server loads the entry
+  from disk. Other tensors are sent normally and stored.
+- **Eviction.** Least recently used entries go first, to stay under `--cache-size` (no fixed limit by default) and to
+  always keep 10% of the disk free. Entries listed to or used by the connected client are never evicted while it is
+  connected; if nothing else can go, new tensors are simply not cached.
+- **Housekeeping.** Writes go to a temporary file renamed into place, so an interrupted write never leaves a truncated
+  entry. At startup the server removes leftover temporary files and entries of the previous cache format (64-bit FNV
+  names), which can never be used again.
+
+**Stored digests: no local reading either.** The main host also remembers the digest of every tensor it uploads, in
+a small index per model file under `$LLAMA_CACHE/rpc-digests/` (default `~/.cache/llama.cpp/rpc-digests/`). When the
+model is loaded again, the loader looks a tensor up there before reading it; if the server's cache holds that digest,
+the tensor is set from the server's cache and **never read from the local disk or hashed**. Only the small tensors and
+anything the server no longer holds are read and sent. Measured with Qwen3-8B Q4_K_M, second load:
+
+| | client CPU time | wall time | uploaded |
+|---|---|---|---|
+| without stored digests (`LLAMA_RPC_DIGESTS=0`) | 4.1 s | 3.7 s | 2.5 MB |
+| with stored digests | **0.4 s** | **2.5 s** | 2.5 MB |
+
+For a model that is not in the OS page cache the difference is larger: without stored digests the whole model is read
+from disk and hashed (~9 GB/s with the x86 SHA extensions, ~1.7 GB/s without them - ~20 s of hashing alone for a
+188 GB model); with them only the ~32 MB of small tensors are read.
+
+An index belongs to one model file, identified by its path, size and modification time; a file that changes in any of
+those gets a new index. If the server has evicted an entry, the tensor is simply read and uploaded again. The index
+trusts that a file with the same path, size and modification time has the same content - a file rewritten in place
+while keeping both (not something downloads, copies or `llama-quantize` do) would load the old weights. Set
+`LLAMA_RPC_DIGESTS=0` to always read and hash. Tensors are always read when `--check-tensors` is used.
 
 ### Forbidding lossy transfers on a server
 
@@ -278,6 +326,8 @@ Codec ids: 1 zstd, 2 shuffled zstd (floats), 3/4/5 q8/q6/q4; +128 when the lossy
 | `GGML_RPC_DEBUG` | both | log verbosity; `2` traces every tensor transfer, `3` adds every compressed payload |
 | `LLAMA_ARG_BACKEND_SAMPLING` | client | `1` is the same as `-bs` |
 | `GGML_RPC_NO_PIPELINE` | client | set to disable request pipelining (see [Round trips](#round-trips)); for debugging |
+| `LLAMA_RPC_DIGESTS` | client | `0` disables the stored weight digests (see [Keeping the weight upload cheap](#keeping-the-weight-upload-cheap)) |
+| `LLAMA_CACHE` | both | cache directory: the server's weight cache (`rpc/`) and the client's digest index (`rpc-digests/`) |
 
 ## Estimating bandwidth
 
@@ -511,8 +561,17 @@ Intended for maintainers; protocol version stays 8.1.0, the compression codec se
 fp8/fp4 build) negotiates `none`. Both sides use `min(local, remote)`. Builds with the RDMA transport compiled in use
 the whole caps array for RDMA and never compress.
 
-**SET_TENSOR**: `| rpc_tensor | flags (u8) | offset (u64) | data |`. Flag bit 0: store in the server cache; bit 1: data is
-a compressed payload. **SET_TENSOR_2D**: when compression was negotiated, a flags byte follows the 4 x u64 header.
+**Features.** The byte before it carries feature flags; bit 0 (`RPC_FEAT_CACHE`) means the server has a disk cache and
+serves `CACHE_LIST` and `SET_TENSOR_CACHED`. Peers without it send zero, and the client then does not use the cache.
+
+**SET_TENSOR**: `| rpc_tensor | flags (u8) | offset (u64) | data |`. Flag bit 0: store in the server cache (the server
+names the entry from its own digest of the data); bit 1: data is a compressed payload.
+
+**CACHE_LIST**: empty request; the response is the 32-byte digests of all cached entries, which stay protected from
+eviction for the connection. **SET_TENSOR_CACHED**: `| rpc_tensor | offset (u64) | size (u64) | digest (32 bytes) |`,
+response one status byte. The client sends it without waiting and the dispatcher aborts if the status is zero.
+**SET_TENSOR_HASH** (64-bit FNV, previous protocol) always answers "miss": a client could collide such a hash on
+purpose. **SET_TENSOR_2D**: when compression was negotiated, a flags byte follows the 4 x u64 header.
 
 **GET_TENSOR / GET_TENSOR_2D**: when compression was negotiated, the request carries an extra `u64 level` - the most
 aggressive level the client allows for that payload (the server cannot tell activations from weights or outputs) - and
@@ -540,7 +599,9 @@ bit-flipped payloads under AddressSanitizer and UBSan.
 
 ## Limitations and known issues
 
-- **No security.** No authentication or encryption; use a tunnel or VPN.
+- **No security.** No authentication or encryption; use a tunnel or VPN. The weight cache is content-addressed with a
+  cryptographic digest computed by the server, so clients cannot poison each other's entries, but any client can fill
+  the cache with data of its own (bounded by `--cache-size` and the 10% free-disk rule).
 - **Both sides must run this build** to use compression. Older peers interoperate without compression.
 - **Logits from a remote output layer** are large and lossless. `-bs` avoids them for generation (see
   [Remote output layer](#remote-output-layer-sample-on-the-server--bs)) but is experimental in llama.cpp and does not
@@ -561,11 +622,15 @@ bit-flipped payloads under AddressSanitizer and UBSan.
 
 ```bash
 cmake -B build -DGGML_RPC=ON -DLLAMA_BUILD_TESTS=ON
-cmake --build build -j --target test-rpc-compress-codec test-rpc-compression ggml-rpc-server
+cmake --build build -j --target test-rpc-compress-codec test-rpc-cache test-rpc-compression ggml-rpc-server
 
 # codec unit tests: lossless round trips, per-level error and ratio bounds,
 # outliers, masks, zero payloads, corrupt payloads
 build/bin/test-rpc-compress-codec
+
+# weight cache: SHA-256 test vectors, cache digest, disk cache store / load /
+# eviction / protection / cleanup
+build/bin/test-rpc-cache
 
 # end to end against real servers: negotiation across 10 server/client level
 # combinations; weights, KV cache, outputs and masks bit-exact; activations

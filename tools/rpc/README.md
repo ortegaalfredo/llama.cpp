@@ -91,12 +91,19 @@ lossless. See [docs/rpc-distributed.md](../../docs/rpc-distributed.md) for level
 
 ### Local cache
 
-The RPC server can use a local cache to store large tensors and avoid transferring them over the network.
-This can speed up model loading significantly, especially when using large models.
-To enable the cache, use the `-c` option:
+The RPC server caches weight tensors of 1 MiB or more on its disk, so loading the same model again does not transfer
+them over the network. The cache is on by default; `--no-cache` disables it.
+
+Entries are named by a SHA-256 based digest that the server computes from the data it received, so one client cannot
+make another client's model load different data. When a client loads a model it fetches the list of cached entries
+once and then sets every cached tensor without waiting for replies, so a warm load costs a single extra round trip.
+
+The least recently used entries are evicted to keep the cache under `--cache-size GiB` (default: no fixed limit) and to
+always leave 10% of the disk free; entries used by the connected client are never evicted while it is connected.
 
 ```bash
-$ bin/ggml-rpc-server -c
+$ bin/ggml-rpc-server --cache-size 200      # keep the cache under 200 GiB
+$ bin/ggml-rpc-server --no-cache
 ```
 
 By default, the cache is stored in the `$HOME/.cache/llama.cpp/rpc` directory and can be controlled via the `LLAMA_CACHE` environment variable.

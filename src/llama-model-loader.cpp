@@ -14,6 +14,152 @@
 #include <future>
 #include <regex>
 #include <unordered_set>
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include <sstream>
+
+#include "ggml-rpc.h"
+
+// Digests of a model file's tensors for the RPC servers' weight cache, kept
+// under $LLAMA_CACHE/rpc-digests: when a model is loaded again, tensors the
+// servers already hold are set from their cache without reading, hashing or
+// sending the data. An index belongs to one file, identified by its path, size
+// and modification time; a file changed in any of those starts a new index.
+// LLAMA_RPC_DIGESTS=0 disables it.
+namespace {
+
+struct rpc_digest_index {
+    using digest = std::array<uint8_t, 32>;
+
+    std::string index_path; // empty when the index cannot be used
+    std::string key;
+    std::map<std::pair<uint64_t, uint64_t>, digest> entries; // (file offset, size) -> digest
+    bool dirty = false;
+
+    static std::filesystem::path cache_dir() {
+        const char * env = std::getenv("LLAMA_CACHE");
+        if (env != nullptr && env[0] != '\0') {
+            return env;
+        }
+        std::filesystem::path dir;
+#if defined(_WIN32)
+        if (const char * p = std::getenv("LOCALAPPDATA")) {
+            dir = p;
+        }
+#elif defined(__APPLE__)
+        if (const char * p = std::getenv("HOME")) {
+            dir = std::filesystem::path(p) / "Library" / "Caches";
+        }
+#else
+        if (const char * p = std::getenv("XDG_CACHE_HOME"); p != nullptr && p[0] != '\0') {
+            dir = p;
+        } else if (const char * h = std::getenv("HOME")) {
+            dir = std::filesystem::path(h) / ".cache";
+        }
+#endif
+        return dir.empty() ? dir : dir / "llama.cpp";
+    }
+
+    static int hex_val(char c) {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        return -1;
+    }
+
+    void open(const std::string & model_path) {
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        fs::path path = fs::weakly_canonical(model_path, ec);
+        if (ec) {
+            path = model_path;
+        }
+        const auto size  = fs::file_size(path, ec);
+        if (ec) {
+            return;
+        }
+        const auto mtime = fs::last_write_time(path, ec);
+        const fs::path dir = cache_dir();
+        if (ec || dir.empty()) {
+            return;
+        }
+        key = path.string() + "\t" + std::to_string(size) + "\t" + std::to_string((long long) mtime.time_since_epoch().count());
+        fs::create_directories(dir / "rpc-digests", ec);
+        char name[32];
+        snprintf(name, sizeof(name), "%016zx.txt", std::hash<std::string>{}(key));
+        index_path = (dir / "rpc-digests" / name).string();
+
+        std::ifstream f(index_path);
+        std::string line;
+        if (!f || !std::getline(f, line) || line != "ggml-rpc-digests 1" || !std::getline(f, line) || line != key) {
+            return; // no index yet, or one for another version of the file
+        }
+        while (std::getline(f, line)) {
+            std::istringstream ls(line);
+            uint64_t offs, n;
+            std::string hex;
+            if (!(ls >> offs >> n >> hex) || hex.size() != 64) {
+                continue;
+            }
+            digest d;
+            bool ok = true;
+            for (size_t i = 0; i < 32 && ok; ++i) {
+                const int hi = hex_val(hex[2*i]);
+                const int lo = hex_val(hex[2*i + 1]);
+                ok = hi >= 0 && lo >= 0;
+                d[i] = (uint8_t) (hi << 4 | lo);
+            }
+            if (ok) {
+                entries[{offs, n}] = d;
+            }
+        }
+    }
+
+    const uint8_t * find(uint64_t offs, uint64_t size) const {
+        auto it = entries.find({offs, size});
+        return it == entries.end() ? nullptr : it->second.data();
+    }
+
+    void add(uint64_t offs, uint64_t size, const uint8_t * d) {
+        digest & e = entries[{offs, size}];
+        if (memcmp(e.data(), d, e.size()) != 0) {
+            memcpy(e.data(), d, e.size());
+            dirty = true;
+        }
+    }
+
+    void save() {
+        if (!dirty || index_path.empty()) {
+            return;
+        }
+        // written to a temporary file and renamed, so readers never see a partial index
+        const std::string tmp = index_path + ".tmp";
+        {
+            std::ofstream f(tmp, std::ios::trunc);
+            f << "ggml-rpc-digests 1\n" << key << "\n";
+            static const char * digits = "0123456789abcdef";
+            for (const auto & [k, d] : entries) {
+                std::string hex(64, '0');
+                for (size_t i = 0; i < 32; ++i) {
+                    hex[2*i]     = digits[d[i] >> 4];
+                    hex[2*i + 1] = digits[d[i] & 0xf];
+                }
+                f << k.first << " " << k.second << " " << hex << "\n";
+            }
+            if (!f.good()) {
+                return;
+            }
+        }
+        std::error_code ec;
+        std::filesystem::rename(tmp, index_path, ec);
+        if (ec) {
+            std::filesystem::remove(tmp, ec);
+        }
+        dirty = false;
+    }
+};
+
+} // namespace
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
@@ -578,6 +724,7 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
         files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
+        file_paths.push_back(fname);
         contexts.emplace_back(ctx);
 
         // Save tensors data offset of the main file.
@@ -646,6 +793,7 @@ llama_model_loader::llama_model_loader(
                 }
 
                 files.emplace_back(new llama_file(fname_split, "rb", use_direct_io));
+                file_paths.push_back(fname_split);
                 contexts.emplace_back(ctx);
 
                 // Save tensors data offset info of the shard.
@@ -697,6 +845,7 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
         files.emplace_back(new llama_file(file));
+        file_paths.push_back("");
         contexts.emplace_back(ctx);
 
         // Save tensors data offset info of the main file.
@@ -1663,6 +1812,50 @@ bool llama_model_loader::load_all_data(
             ggml_backend_name(upload_backend));
     }
 
+    // RPC weight cache: a tensor whose stored digest the server holds is set
+    // from the server's cache without reading it; the others record their
+    // digest as they are uploaded (see rpc_digest_index)
+    ggml_backend_reg_t                   rpc_reg        = ggml_backend_reg_by_name("RPC");
+    ggml_backend_rpc_set_tensor_cached_t rpc_set_cached = nullptr;
+    ggml_backend_rpc_set_tensor_digest_t rpc_set_digest = nullptr;
+    if (rpc_reg != nullptr) {
+        const char * env = std::getenv("LLAMA_RPC_DIGESTS");
+        if (env == nullptr || strcmp(env, "0") != 0) {
+            rpc_set_cached = (ggml_backend_rpc_set_tensor_cached_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_set_tensor_cached");
+            rpc_set_digest = (ggml_backend_rpc_set_tensor_digest_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_set_tensor_digest");
+        }
+    }
+    std::vector<std::unique_ptr<rpc_digest_index>> rpc_digests(files.size());
+    auto rpc_index = [&](uint32_t idx) -> rpc_digest_index & {
+        if (!rpc_digests[idx]) {
+            rpc_digests[idx] = std::make_unique<rpc_digest_index>();
+            if (!file_paths[idx].empty()) {
+                rpc_digests[idx]->open(file_paths[idx]);
+            }
+        }
+        return *rpc_digests[idx];
+    };
+    auto is_rpc_buffer = [&](ggml_backend_buffer_t buf) {
+        if (buf == nullptr || rpc_reg == nullptr) {
+            return false;
+        }
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf));
+        return dev != nullptr && ggml_backend_dev_backend_reg(dev) == rpc_reg;
+    };
+    // uploads a tensor's data; for RPC weights, also records the digest
+    auto upload = [&](ggml_tensor * cur, const auto * weight, const void * data, size_t n_size, bool rpc_weight) {
+        if (rpc_weight && rpc_set_digest != nullptr) {
+            uint8_t digest[32];
+            if (rpc_set_digest(cur, data, 0, n_size, digest)) {
+                rpc_index(weight->idx).add(weight->offs, n_size, digest);
+            }
+        } else {
+            ggml_backend_tensor_set(cur, data, 0, n_size);
+        }
+    };
+    size_t rpc_n_cached     = 0;
+    size_t rpc_bytes_cached = 0;
+
     std::vector<ggml_tensor *> tensors;
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
         tensors.push_back(cur);
@@ -1698,6 +1891,18 @@ bool llama_model_loader::load_all_data(
 
         const bool from_mapping = use_mmap || lazy.has(cur);
 
+        // validation and lazy tensors need the data, so they are always read
+        const bool rpc_weight = rpc_set_cached != nullptr && !check_tensors && !lazy.has(cur) && is_rpc_buffer(cur->buffer);
+        if (rpc_weight) {
+            const uint8_t * digest = rpc_index(weight->idx).find(weight->offs, n_size);
+            if (digest != nullptr && rpc_set_cached(cur, 0, n_size, digest)) {
+                rpc_n_cached++;
+                rpc_bytes_cached += n_size;
+                size_done += n_size;
+                continue;
+            }
+        }
+
         if (from_mapping) {
             const auto & mapping = mappings.at(weight->idx);
             uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;
@@ -1732,7 +1937,7 @@ bool llama_model_loader::load_all_data(
                 mmap_used.first  = std::min(mmap_used.first,  weight->offs);
                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
             } else {
-                ggml_backend_tensor_set(cur, data, 0, n_size);
+                upload(cur, weight, data, n_size, rpc_weight);
             }
         } else {
             const auto & file = files.at(weight->idx);
@@ -1804,7 +2009,7 @@ bool llama_model_loader::load_all_data(
                     std::vector<no_init<uint8_t>> read_buf(n_size);
                     file->seek(weight->offs, SEEK_SET);
                     file->read_raw(read_buf.data(), n_size);
-                    ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
+                    upload(cur, weight, read_buf.data(), n_size, rpc_weight);
                     if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
                         throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
                     }
@@ -1813,6 +2018,16 @@ bool llama_model_loader::load_all_data(
         }
 
         size_done += n_size;
+    }
+
+    for (auto & index : rpc_digests) {
+        if (index) {
+            index->save();
+        }
+    }
+    if (rpc_n_cached > 0) {
+        LLAMA_LOG_INFO("%s: %zu tensors (%.2f GiB) set from the RPC servers' weight cache without reading them\n",
+                       __func__, rpc_n_cached, rpc_bytes_cached / 1073741824.0);
     }
 
     // free temporary resources used for async uploads

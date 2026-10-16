@@ -116,6 +116,8 @@ struct llama_model_loader {
     } lazy;
 
     llama_files files;
+    // path of each entry of `files`, empty when the model was opened from a FILE *
+    std::vector<std::string> file_paths;
     llama_ftype ftype;
     llama_fver  fver;
 

@@ -28,6 +28,16 @@ if (LLAMA_BUILD_TESTS AND UNIX AND NOT GGML_BACKEND_DL)
         set_property(TEST test-rpc-compress-codec PROPERTY LABELS main)
     endif()
 
+    # weight cache: SHA-256 test vectors, cache digest, disk cache eviction rules
+    add_executable(test-rpc-cache
+        ${PROJECT_SOURCE_DIR}/tests/test-rpc-cache.cpp
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-rpc/rpc-cache.cpp)
+    target_link_libraries(test-rpc-cache PRIVATE ggml)
+    target_include_directories(test-rpc-cache PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src ${PROJECT_SOURCE_DIR}/ggml/src/ggml-rpc)
+    target_compile_features(test-rpc-cache PRIVATE cxx_std_17)
+    add_test(NAME test-rpc-cache COMMAND $<TARGET_FILE:test-rpc-cache>)
+    set_property(TEST test-rpc-cache PROPERTY LABELS main)
+
     # transport compression end to end: every level against a real server;
     # activations within their level's error, weights and outputs exact
     add_executable(test-rpc-compression ${PROJECT_SOURCE_DIR}/tests/test-rpc-compression.cpp)
